@@ -38,6 +38,7 @@
 - Built with TypeScript and the official MCP SDK
 - **Configurable timeout protection** with automatic process abortion
 - **Graceful timeout handling** - attempts to kill hanging processes before closing connections
+- **Execution mode selection** - choose per-command exec channels or a shared persistent shell session
 
 ### Tools
 
@@ -94,6 +95,9 @@ You can configure your IDE or LLM like Cursor, Windsurf, Claude Desktop to use t
 - `timeout`: Command execution timeout in milliseconds (default: 60000ms = 1 minute)
 - `maxChars`: Maximum allowed characters for the `command` input (default: 1000). Use `none` or `0` to disable the limit.
 - `disableSudo`: Flag to disable the `sudo-exec` tool completely. Useful when sudo access is not needed or not available.
+- `executionMode`: How commands run after connect. Default: `exec`. Supported values:
+  - `exec`: Open a new SSH execution channel per command (default)
+  - `shell` / `persistent-shell`: Keep one shell channel open and run all commands through it
 
 
 ```commandline
@@ -111,7 +115,8 @@ You can configure your IDE or LLM like Cursor, Windsurf, Claude Desktop to use t
                 "--password=pass",
                 "--key=path/to/key",
                 "--timeout=30000",
-                "--maxChars=none"
+                "--maxChars=none",
+                "--executionMode=persistent-shell"
             ]
         }
     }
@@ -143,6 +148,11 @@ claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=example.com
 **With Custom Timeout and No Character Limit:**
 ```bash
 claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=192.168.1.100 --user=admin --password=your_password --timeout=120000 --maxChars=none
+```
+
+**With Persistent Shell Mode (single shared remote shell):**
+```bash
+claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=192.168.1.100 --user=admin --password=your_password --executionMode=persistent-shell
 ```
 
 **With Sudo and Su Support:**
