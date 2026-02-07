@@ -6,7 +6,7 @@ import { Client, ClientChannel } from 'ssh2';
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
-// Example usage: node build/index.js --host=1.2.3.4 --port=22 --user=root --password=pass --key=path/to/key --timeout=5000 --disableSudo
+// Example usage: node build/index.js --host=1.2.3.4 --port=22 --user=root --password=pass --key=path/to/key --timeout=5000 --executionMode=persistent-shell --disableSudo
 function parseArgv() {
   const args = process.argv.slice(2);
   const config: Record<string, string | null> = {};
@@ -56,11 +56,35 @@ const MAX_CHARS = (() => {
   return 1000;
 })();
 
+export type SSHExecutionMode = 'exec' | 'persistent-shell';
+
+function parseExecutionMode(rawMode: string | null | undefined): SSHExecutionMode {
+  if (rawMode === undefined) return 'exec';
+  if (rawMode === null) {
+    throw new Error('Invalid --executionMode: value is required (exec, shell, persistent-shell)');
+  }
+  const normalized = rawMode.trim().toLowerCase();
+  if (normalized === 'exec') return 'exec';
+  if (normalized === 'shell' || normalized === 'persistent' || normalized === 'persistent-shell') {
+    return 'persistent-shell';
+  }
+  throw new Error(`Invalid --executionMode: ${rawMode}. Valid values: exec, shell, persistent-shell`);
+}
+
+const EXECUTION_MODE = parseExecutionMode(argvConfig.executionMode);
+
 function validateConfig(config: Record<string, string | null>) {
   const errors = [];
   if (!config.host) errors.push('Missing required --host');
   if (!config.user) errors.push('Missing required --user');
   if (config.port && isNaN(Number(config.port))) errors.push('Invalid --port');
+  if (config.executionMode) {
+    try {
+      parseExecutionMode(config.executionMode);
+    } catch (err) {
+      errors.push((err as Error).message);
+    }
+  }
   if (errors.length > 0) {
     throw new Error('Configuration error:\n' + errors.join('\n'));
   }
@@ -113,7 +137,14 @@ export interface SSHConfig {
   password?: string;
   privateKey?: string;
   suPassword?: string;
-  sudoPassword?: string;  // Password for sudo commands specifically (if different from suPassword)
+  sudoPassword?: string;
+  executionMode?: SSHExecutionMode;
+}
+
+interface CommandExecutionResult {
+  stdout: string;
+  stderr: string;
+  code: number | null;
 }
 
 export class SSHConnectionManager {
@@ -121,12 +152,359 @@ export class SSHConnectionManager {
   private sshConfig: SSHConfig;
   private isConnecting = false;
   private connectionPromise: Promise<void> | null = null;
-  private suShell: any = null;  // Store the elevated shell session
+  private suShell: ClientChannel | null = null;
   private suPromise: Promise<void> | null = null;
-  private isElevated = false;  // Track if we're in su mode
+  private isElevated = false;
+  private persistentShell: ClientChannel | null = null;
+  private persistentShellPromise: Promise<ClientChannel> | null = null;
+  private shellQueue: Promise<void> = Promise.resolve();
+  private persistentStdoutCarry = '';
+  private suStdoutCarry = '';
 
   constructor(config: SSHConfig) {
-    this.sshConfig = config;
+    this.sshConfig = {
+      ...config,
+      executionMode: config.executionMode ?? 'exec',
+    };
+  }
+
+  private getConnectConfig() {
+    return {
+      host: this.sshConfig.host,
+      port: this.sshConfig.port,
+      username: this.sshConfig.username,
+      password: this.sshConfig.password,
+      privateKey: this.sshConfig.privateKey,
+    };
+  }
+
+  private isChannelAlive(channel: ClientChannel | null): channel is ClientChannel {
+    if (!channel) return false;
+    return !(channel as any).destroyed && !(channel as any).closed;
+  }
+
+  private resetShellState(): void {
+    this.suShell = null;
+    this.suPromise = null;
+    this.isElevated = false;
+    this.persistentShell = null;
+    this.persistentShellPromise = null;
+    this.persistentStdoutCarry = '';
+    this.suStdoutCarry = '';
+  }
+
+  private closeSuShell(): void {
+    if (this.suShell) {
+      try { this.suShell.end(); } catch (_e) { /* ignore */ }
+      this.suShell = null;
+    }
+    this.isElevated = false;
+    this.suPromise = null;
+    this.suStdoutCarry = '';
+  }
+
+  private closePersistentShell(): void {
+    if (this.persistentShell) {
+      try { this.persistentShell.end(); } catch (_e) { /* ignore */ }
+      this.persistentShell = null;
+    }
+    this.persistentShellPromise = null;
+    this.persistentStdoutCarry = '';
+  }
+
+  private makeShellMarker(): string {
+    return `__SSH_MCP_DONE_${Date.now()}_${Math.random().toString(16).slice(2)}__`;
+  }
+
+  private extractShellMarker(
+    buffer: string,
+    marker: string
+  ): { done: false } | { done: true; output: string; code: number; remainder: string } {
+    const markerPrefix = `${marker}:`;
+    const markerIndex = buffer.indexOf(markerPrefix);
+    if (markerIndex === -1) return { done: false };
+
+    const afterMarker = buffer.slice(markerIndex + markerPrefix.length);
+    const newlineIndex = afterMarker.indexOf('\n');
+    if (newlineIndex === -1) return { done: false };
+
+    const codeRaw = afterMarker.slice(0, newlineIndex).trim();
+    const code = Number.parseInt(codeRaw, 10);
+    if (Number.isNaN(code)) return { done: false };
+
+    return {
+      done: true,
+      output: buffer.slice(0, markerIndex),
+      code,
+      remainder: afterMarker.slice(newlineIndex + 1),
+    };
+  }
+
+  private enqueueShellCommand<T>(task: () => Promise<T>): Promise<T> {
+    const queuedTask = this.shellQueue.then(task, task);
+    this.shellQueue = queuedTask.then(() => undefined, () => undefined);
+    return queuedTask;
+  }
+
+  private async ensurePersistentShell(): Promise<ClientChannel> {
+    if (this.isChannelAlive(this.persistentShell)) {
+      return this.persistentShell;
+    }
+    if (this.persistentShellPromise) {
+      return this.persistentShellPromise;
+    }
+
+    this.persistentShellPromise = new Promise((resolve, reject) => {
+      const conn = this.getConnection();
+      conn.exec('/bin/sh', (err: Error | undefined, stream: ClientChannel) => {
+        if (err) {
+          this.persistentShellPromise = null;
+          reject(new McpError(ErrorCode.InternalError, `Failed to start persistent shell: ${err.message}`));
+          return;
+        }
+
+        const cleanup = () => {
+          if (this.persistentShell === stream) {
+            this.persistentShell = null;
+          }
+          this.persistentShellPromise = null;
+          this.persistentStdoutCarry = '';
+        };
+
+        stream.on('close', cleanup);
+        stream.on('end', cleanup);
+        stream.on('error', cleanup);
+
+        this.persistentShell = stream;
+        this.persistentShellPromise = null;
+        resolve(stream);
+      });
+    });
+
+    return this.persistentShellPromise;
+  }
+
+  private trimInteractiveCommandEcho(output: string, command: string): string {
+    const normalized = output.replace(/\r/g, '');
+    const lines = normalized.split('\n');
+    if (lines.length > 0 && lines[0].includes(command)) {
+      lines.shift();
+    }
+    return lines.join('\n');
+  }
+
+  private async executeWithPersistentShell(command: string, timeoutMs: number): Promise<CommandExecutionResult> {
+    return this.enqueueShellCommand(async () => {
+      const shell = await this.ensurePersistentShell();
+      return new Promise((resolve, reject) => {
+        const marker = this.makeShellMarker();
+        let stdoutBuffer = this.persistentStdoutCarry;
+        this.persistentStdoutCarry = '';
+        let stderr = '';
+        let settled = false;
+
+        const cleanup = () => {
+          clearTimeout(timeoutId);
+          shell.removeListener('data', onStdout);
+          shell.removeListener('close', onClose);
+          shell.removeListener('error', onError);
+          try { (shell as any).stderr?.removeListener('data', onStderr); } catch (_e) { /* ignore */ }
+        };
+
+        const finishWithError = (error: McpError) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(error);
+        };
+
+        const finishWithResult = (result: CommandExecutionResult) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(result);
+        };
+
+        const onStdout = (chunk: Buffer) => {
+          stdoutBuffer += chunk.toString();
+          const parsed = this.extractShellMarker(stdoutBuffer, marker);
+          if (!parsed.done) return;
+
+          this.persistentStdoutCarry = parsed.remainder;
+          finishWithResult({
+            stdout: parsed.output,
+            stderr,
+            code: parsed.code,
+          });
+        };
+
+        const onStderr = (chunk: Buffer) => {
+          stderr += chunk.toString();
+        };
+
+        const onClose = () => {
+          finishWithError(new McpError(ErrorCode.InternalError, 'Persistent shell closed unexpectedly'));
+        };
+
+        const onError = (err: Error) => {
+          finishWithError(new McpError(ErrorCode.InternalError, `Persistent shell error: ${err.message}`));
+        };
+
+        const timeoutId = setTimeout(() => {
+          this.closePersistentShell();
+          finishWithError(new McpError(ErrorCode.InternalError, `Command execution timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+
+        shell.on('data', onStdout);
+        shell.on('close', onClose);
+        shell.on('error', onError);
+        try { (shell as any).stderr?.on('data', onStderr); } catch (_e) { /* ignore */ }
+
+        const payload = `${command}\nprintf '${marker}:%s\\n' "$?"\n`;
+        try {
+          shell.write(payload);
+        } catch (err: any) {
+          finishWithError(new McpError(ErrorCode.InternalError, `Failed writing to persistent shell: ${err?.message || err}`));
+        }
+      });
+    });
+  }
+
+  private async executeWithSuShell(command: string, timeoutMs: number): Promise<CommandExecutionResult> {
+    return this.enqueueShellCommand(async () => {
+      if (!this.isChannelAlive(this.suShell)) {
+        throw new McpError(ErrorCode.InternalError, 'su shell is not available');
+      }
+
+      const shell = this.suShell;
+      return new Promise((resolve, reject) => {
+        const marker = this.makeShellMarker();
+        let buffer = this.suStdoutCarry;
+        this.suStdoutCarry = '';
+        let settled = false;
+
+        const cleanup = () => {
+          clearTimeout(timeoutId);
+          shell.removeListener('data', onData);
+          shell.removeListener('close', onClose);
+          shell.removeListener('error', onError);
+        };
+
+        const finishWithError = (error: McpError) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(error);
+        };
+
+        const finishWithResult = (result: CommandExecutionResult) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(result);
+        };
+
+        const onData = (chunk: Buffer) => {
+          buffer += chunk.toString();
+          const parsed = this.extractShellMarker(buffer, marker);
+          if (!parsed.done) return;
+
+          this.suStdoutCarry = parsed.remainder;
+          finishWithResult({
+            stdout: this.trimInteractiveCommandEcho(parsed.output, command),
+            stderr: '',
+            code: parsed.code,
+          });
+        };
+
+        const onClose = () => {
+          this.closeSuShell();
+          finishWithError(new McpError(ErrorCode.InternalError, 'su shell closed unexpectedly'));
+        };
+
+        const onError = (err: Error) => {
+          this.closeSuShell();
+          finishWithError(new McpError(ErrorCode.InternalError, `su shell error: ${err.message}`));
+        };
+
+        const timeoutId = setTimeout(() => {
+          this.closeSuShell();
+          finishWithError(new McpError(ErrorCode.InternalError, `Command execution timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+
+        shell.on('data', onData);
+        shell.on('close', onClose);
+        shell.on('error', onError);
+
+        const payload = `${command}\nprintf '${marker}:%s\\n' "$?"\n`;
+        try {
+          shell.write(payload);
+        } catch (err: any) {
+          finishWithError(new McpError(ErrorCode.InternalError, `Failed writing to su shell: ${err?.message || err}`));
+        }
+      });
+    });
+  }
+
+  private async executeWithExec(command: string, stdin: string | undefined, timeoutMs: number): Promise<CommandExecutionResult> {
+    return new Promise((resolve, reject) => {
+      const conn = this.getConnection();
+      let settled = false;
+
+      const timeoutId = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new McpError(ErrorCode.InternalError, `Command execution timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      conn.exec(command, (err: Error | undefined, stream: ClientChannel) => {
+        if (err) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          reject(new McpError(ErrorCode.InternalError, `SSH exec error: ${err.message}`));
+          return;
+        }
+
+        let stdout = '';
+        let stderr = '';
+
+        if (stdin && stdin.length > 0) {
+          try {
+            stream.write(stdin);
+          } catch (_e) {
+            // ignore
+          }
+        }
+        try { stream.end(); } catch (_e) { /* ignore */ }
+
+        stream.on('data', (data: Buffer) => {
+          stdout += data.toString();
+        });
+
+        stream.stderr.on('data', (data: Buffer) => {
+          stderr += data.toString();
+        });
+
+        stream.on('error', (streamErr: Error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          reject(new McpError(ErrorCode.InternalError, `SSH exec stream error: ${streamErr.message}`));
+        });
+
+        stream.on('close', (code: number | undefined) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          resolve({
+            stdout,
+            stderr,
+            code: typeof code === 'number' ? code : null,
+          });
+        });
+      });
+    });
   }
 
   async connect(): Promise<void> {
@@ -150,24 +528,33 @@ export class SSHConnectionManager {
         reject(new McpError(ErrorCode.InternalError, 'SSH connection timeout'));
       }, 30000); // 30 seconds connection timeout
 
-      this.conn.on('ready', async () => {
+      this.conn.on('ready', () => {
         clearTimeout(timeoutId);
         this.isConnecting = false;
 
-        // In test mode, don't wait for su elevation during connection setup, as it
-        // may cause JSON-RPC server initialization to hang. Instead, elevation will
-        // be triggered on-demand when a command is executed.
-        // In production, elevation during connection is desirable for robustness.
-        if (this.sshConfig.suPassword && !process.env.SSH_MCP_TEST) {
-          try {
-            await this.ensureElevated();
-          } catch (err) {
-            // Do not reject the connection; just log the error. Subsequent commands
-            // will either use the su shell if available or fall back to normal execution.
+        const onReady = async () => {
+          if (this.sshConfig.suPassword && !process.env.SSH_MCP_TEST) {
+            try {
+              await this.ensureElevated();
+            } catch (_err) {
+              // continue without su shell, command execution will fallback
+            }
           }
-        }
 
-        resolve();
+          if (this.sshConfig.executionMode === 'persistent-shell' && !this.isElevated) {
+            await this.ensurePersistentShell();
+          }
+        };
+
+        onReady()
+          .then(() => resolve())
+          .catch((err: any) => {
+            this.conn?.end();
+            this.conn = null;
+            this.isConnecting = false;
+            this.connectionPromise = null;
+            reject(new McpError(ErrorCode.InternalError, `SSH post-connect setup failed: ${err?.message || err}`));
+          });
       });
 
       this.conn.on('error', (err: Error) => {
@@ -180,6 +567,7 @@ export class SSHConnectionManager {
 
       this.conn.on('end', () => {
         console.error('SSH connection ended');
+        this.resetShellState();
         this.conn = null;
         this.isConnecting = false;
         this.connectionPromise = null;
@@ -187,12 +575,13 @@ export class SSHConnectionManager {
 
       this.conn.on('close', () => {
         console.error('SSH connection closed');
+        this.resetShellState();
         this.conn = null;
         this.isConnecting = false;
         this.connectionPromise = null;
       });
 
-      this.conn.connect(this.sshConfig);
+      this.conn.connect(this.getConnectConfig());
     });
 
     return this.connectionPromise;
@@ -204,6 +593,10 @@ export class SSHConnectionManager {
 
   getSudoPassword(): string | undefined {
     return this.sshConfig.sudoPassword;
+  }
+
+  setSudoPassword(pwd?: string): void {
+    this.sshConfig.sudoPassword = pwd;
   }
 
   getSuPassword(): string | undefined {
@@ -221,14 +614,12 @@ export class SSHConnectionManager {
     } else {
       // If clearing suPassword, drop any existing suShell
       if (this.suShell) {
-        try { this.suShell.end(); } catch (e) { /* ignore */ }
-        this.suShell = null;
-        this.isElevated = false;
+        this.closeSuShell();
       }
     }
   }
 
-  private async ensureElevated(): Promise<void> {
+  async ensureElevated(): Promise<void> {
     if (this.isElevated && this.suShell) return;
     if (!this.sshConfig.suPassword) return;
 
@@ -277,6 +668,7 @@ export class SSHConnectionManager {
               this.suShell = stream;
               this.isElevated = true;
               this.suPromise = null;
+              this.suStdoutCarry = '';
               resolve();
               return;
             }
@@ -314,6 +706,24 @@ export class SSHConnectionManager {
     if (!this.isConnected()) {
       await this.connect();
     }
+
+    if (this.sshConfig.executionMode === 'persistent-shell' && !this.isElevated) {
+      await this.ensurePersistentShell();
+    }
+  }
+
+  async executeCommand(command: string, stdin?: string, timeoutMs = DEFAULT_TIMEOUT): Promise<CommandExecutionResult> {
+    await this.ensureConnected();
+
+    if (this.isElevated && this.isChannelAlive(this.suShell)) {
+      return this.executeWithSuShell(command, timeoutMs);
+    }
+
+    if (this.sshConfig.executionMode === 'persistent-shell') {
+      return this.executeWithPersistentShell(command, timeoutMs);
+    }
+
+    return this.executeWithExec(command, stdin, timeoutMs);
   }
 
   getConnection(): Client {
@@ -324,19 +734,54 @@ export class SSHConnectionManager {
   }
 
   close(): void {
-    if (this.conn) {
-      if (this.suShell) {
-        try { this.suShell.end(); } catch (e) { /* ignore */ }
-        this.suShell = null;
-        this.isElevated = false;
-      }
-      this.conn.end();
-      this.conn = null;
-    }
+    this.closeSuShell();
+    this.closePersistentShell();
+    if (!this.conn) return;
+    this.conn.end();
+    this.conn = null;
   }
 }
 
 let connectionManager: SSHConnectionManager | null = null;
+let cachedPrivateKey: string | null = null;
+
+async function buildSshConfigFromCli(): Promise<SSHConfig> {
+  if (!HOST || !USER) {
+    throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
+  }
+
+  const sshConfig: SSHConfig = {
+    host: HOST,
+    port: PORT || 22,
+    username: USER,
+    executionMode: EXECUTION_MODE,
+  };
+
+  if (PASSWORD) {
+    sshConfig.password = PASSWORD;
+  } else if (KEY) {
+    if (cachedPrivateKey === null) {
+      const fs = await import('fs/promises');
+      cachedPrivateKey = await fs.readFile(KEY, 'utf8');
+    }
+    sshConfig.privateKey = cachedPrivateKey;
+  }
+
+  if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
+    sshConfig.suPassword = sanitizePassword(SUPASSWORD);
+  }
+  if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) {
+    sshConfig.sudoPassword = sanitizePassword(SUDOPASSWORD);
+  }
+
+  return sshConfig;
+}
+
+async function getOrCreateConnectionManager(): Promise<SSHConnectionManager> {
+  if (connectionManager) return connectionManager;
+  connectionManager = new SSHConnectionManager(await buildSshConfigFromCli());
+  return connectionManager;
+}
 
 const server = new McpServer({
   name: 'SSH MCP Server',
@@ -359,39 +804,15 @@ server.tool(
     const sanitizedCommand = sanitizeCommand(command);
 
     try {
-      // Initialize connection manager if not already done
-      if (!connectionManager) {
-        if (!HOST || !USER) {
-          throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
-        }
-        const sshConfig: SSHConfig = {
-          host: HOST,
-          port: PORT,
-          username: USER,
-        };
-
-        if (PASSWORD) {
-          sshConfig.password = PASSWORD;
-        } else if (KEY) {
-          const fs = await import('fs/promises');
-          sshConfig.privateKey = await fs.readFile(KEY, 'utf8');
-        }
-
-        if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
-          sshConfig.suPassword = sanitizePassword(SUPASSWORD);
-        }
-        connectionManager = new SSHConnectionManager(sshConfig);
-      }
-
-      // Ensure connection is active (reconnect if needed)
-      await connectionManager.ensureConnected();
+      const manager = await getOrCreateConnectionManager();
+      await manager.ensureConnected();
 
       // If a suPassword was provided, explicitly wait for elevation before executing.
       // This is critical: ensureElevated is idempotent and will return immediately if
       // already elevated, so this ensures we have a su shell before we try to use it.
-      if ((connectionManager as any).getSuPassword && (connectionManager as any).getSuPassword()) {
+      if (manager.getSuPassword()) {
         try {
-          const elevationPromise = (connectionManager as any).ensureElevated();
+          const elevationPromise = manager.ensureElevated();
           // Add a short timeout for elevation to complete
           await Promise.race([
             elevationPromise,
@@ -407,7 +828,7 @@ server.tool(
         ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
         : sanitizedCommand;
 
-      const result = await execSshCommandWithConnection(connectionManager, commandWithDescription);
+      const result = await execSshCommandWithConnection(manager, commandWithDescription);
       return result;
     } catch (err: any) {
       // Wrap unexpected errors
@@ -430,47 +851,22 @@ if (!DISABLE_SUDO) {
       const sanitizedCommand = sanitizeCommand(command);
 
       try {
-        if (!connectionManager) {
-          if (!HOST || !USER) {
-            throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
-          }
-
-          const sshConfig: SSHConfig = {
-            host: HOST,
-            port: PORT || 22,
-            username: USER,
-          };
-          if (PASSWORD) {
-            sshConfig.password = PASSWORD;
-          } else if (KEY) {
-            const fs = await import('fs/promises');
-            sshConfig.privateKey = await fs.readFile(KEY, 'utf8');
-          }
-          if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
-            sshConfig.suPassword = sanitizePassword(SUPASSWORD);
-          }
-          if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) {
-            sshConfig.sudoPassword = sanitizePassword(SUDOPASSWORD);
-          }
-          connectionManager = new SSHConnectionManager(sshConfig);
-        }
-
-        await connectionManager.ensureConnected();
+        const manager = await getOrCreateConnectionManager();
+        await manager.ensureConnected();
 
         // If suPassword or sudoPassword were provided on this call but the
         // existing connection manager was created earlier without them,
         // update the manager's values so the subsequent sudo-exec call uses
         // the latest passwords.
         if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
-          await connectionManager.setSuPassword(sanitizePassword(SUPASSWORD));
+          await manager.setSuPassword(sanitizePassword(SUPASSWORD));
         }
         if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) {
-          // update sudoPassword on the manager instance
-          (connectionManager as any).sshConfig = { ...(connectionManager as any).sshConfig, sudoPassword: sanitizePassword(SUDOPASSWORD) };
+          manager.setSudoPassword(sanitizePassword(SUDOPASSWORD));
         }
 
         let wrapped: string;
-        const sudoPassword = connectionManager.getSudoPassword();
+        const sudoPassword = manager.getSudoPassword();
 
         // Append description as comment if provided
         const commandWithDescription = description
@@ -487,7 +883,7 @@ if (!DISABLE_SUDO) {
           wrapped = `printf '%s\\n' '${pwdEscaped}' | sudo -p "" -S sh -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
         }
 
-        return await execSshCommandWithConnection(connectionManager, wrapped);
+        return await execSshCommandWithConnection(manager, wrapped);
       } catch (err: any) {
         if (err instanceof McpError) throw err;
         throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
@@ -498,108 +894,21 @@ if (!DISABLE_SUDO) {
 
 // New function that uses persistent connection
 export async function execSshCommandWithConnection(manager: SSHConnectionManager, command: string, stdin?: string): Promise<{ [x: string]: unknown; content: ({ [x: string]: unknown; type: "text"; text: string; } | { [x: string]: unknown; type: "image"; data: string; mimeType: string; } | { [x: string]: unknown; type: "audio"; data: string; mimeType: string; } | { [x: string]: unknown; type: "resource"; resource: any; })[] }> {
-  return new Promise((resolve, reject) => {
-    let timeoutId: NodeJS.Timeout;
-    let isResolved = false;
+  const result = await manager.executeCommand(command, stdin, DEFAULT_TIMEOUT);
+  const hasErrorOutput = result.stderr.trim().length > 0;
+  const nonZeroExitCode = typeof result.code === 'number' && result.code !== 0;
 
-    const conn = manager.getConnection();
-    const shell = (manager as any).suShell;  // Use su shell if available
+  if (hasErrorOutput || nonZeroExitCode) {
+    const details = result.stderr || result.stdout;
+    throw new McpError(ErrorCode.InternalError, `Error (code ${result.code ?? 'unknown'}):\n${details}`);
+  }
 
-    // Set up timeout
-    timeoutId = setTimeout(() => {
-      if (!isResolved) {
-        isResolved = true;
-        reject(new McpError(ErrorCode.InternalError, `Command execution timed out after ${DEFAULT_TIMEOUT}ms`));
-      }
-    }, DEFAULT_TIMEOUT);
-
-    // If we have an active su shell, use it directly (commands run as root in session)
-    if (shell) {
-      let buffer = '';
-
-      const dataHandler = (data: Buffer) => {
-        const text = data.toString();
-        buffer += text;
-
-        // Wait for root prompt (#) to know command is complete
-        // Match # which indicates root prompt (may be followed by spaces, escape codes, etc)
-        if (/#/.test(buffer)) {
-          if (!isResolved) {
-            isResolved = true;
-            clearTimeout(timeoutId);
-
-            // Extract output: remove the command echo and final prompt
-            const lines = buffer.split('\n');
-            // First line is often the echoed command; last line is the prompt
-            let output = lines.slice(1, -1).join('\n');
-
-            resolve({
-              content: [{
-                type: 'text',
-                text: output + (output ? '\n' : ''),
-              }],
-            });
-          }
-          shell.removeListener('data', dataHandler);
-        }
-      };
-
-      shell.on('data', dataHandler);
-      // Send command immediately; shell is ready after elevation
-      shell.write(command + '\n');
-      return;
-    }
-
-    // No persistent su shell; use normal exec with optional password piping
-    conn.exec(command, (err: Error | undefined, stream: ClientChannel) => {
-      if (err) {
-        if (!isResolved) {
-          isResolved = true;
-          clearTimeout(timeoutId);
-          reject(new McpError(ErrorCode.InternalError, `SSH exec error: ${err.message}`));
-        }
-        return;
-      }
-
-      let stdout = '';
-      let stderr = '';
-
-      // If stdin provided (e.g., sudo password), write it
-      if (stdin && stdin.length > 0) {
-        try {
-          stream.write(stdin);
-        } catch (e) {
-          console.error('Error writing to stdin:', e);
-        }
-      }
-      try { stream.end(); } catch (e) { /* ignore */ }
-
-      stream.on('data', (data: Buffer) => {
-        stdout += data.toString();
-      });
-
-      stream.stderr.on('data', (data: Buffer) => {
-        stderr += data.toString();
-      });
-
-      stream.on('close', (code: number, signal: string) => {
-        if (!isResolved) {
-          isResolved = true;
-          clearTimeout(timeoutId);
-          if (stderr) {
-            reject(new McpError(ErrorCode.InternalError, `Error (code ${code}):\n${stderr}`));
-          } else {
-            resolve({
-              content: [{
-                type: 'text',
-                text: stdout,
-              }],
-            });
-          }
-        }
-      });
-    });
-  });
+  return {
+    content: [{
+      type: 'text',
+      text: result.stdout,
+    }],
+  };
 }
 
 // Keep the old function for backward compatibility (used in tests)
@@ -697,6 +1006,12 @@ async function main() {
   await server.connect(transport);
   console.error("SSH MCP Server running on stdio");
 
+  if (EXECUTION_MODE === 'persistent-shell') {
+    const manager = await getOrCreateConnectionManager();
+    await manager.ensureConnected();
+    console.error("persistent shell mode enabled, SSH session preconnected");
+  }
+
   // Handle graceful shutdown
   const cleanup = () => {
     console.error("Shutting down SSH MCP Server...");
@@ -719,10 +1034,16 @@ async function main() {
 // Initialize server in test mode for automated tests
 if (isTestMode) {
   const transport = new StdioServerTransport();
-  server.connect(transport).catch(error => {
-    console.error("Fatal error connecting server:", error);
-    process.exit(1);
-  });
+  server.connect(transport)
+    .then(async () => {
+      if (EXECUTION_MODE !== 'persistent-shell') return;
+      const manager = await getOrCreateConnectionManager();
+      await manager.ensureConnected();
+    })
+    .catch(error => {
+      console.error("Fatal error connecting server:", error);
+      process.exit(1);
+    });
 }
 // Start server in CLI mode
 else if (isCliEnabled) {

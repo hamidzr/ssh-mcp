@@ -276,6 +276,38 @@ describe('SSHConnectionManager', () => {
       
       expect((result.content[0] as any).text).toContain('Hello!');
     }, 30000);
+
+    it('should not persist shell state in exec mode', async () => {
+      await manager.connect();
+
+      await execSshCommandWithConnection(manager, 'export SSH_MCP_EXEC_MODE_VAR="kept"');
+      const result = await execSshCommandWithConnection(manager, 'echo "${SSH_MCP_EXEC_MODE_VAR:-missing}"');
+
+      expect((result.content[0] as any).text.trim()).toBe('missing');
+    }, 30000);
+
+    it('should persist shell state in persistent-shell mode', async () => {
+      const persistentManager = new SSHConnectionManager({
+        host,
+        port,
+        username,
+        password,
+        executionMode: 'persistent-shell',
+      });
+
+      try {
+        await persistentManager.connect();
+        await execSshCommandWithConnection(persistentManager, 'export SSH_MCP_PERSISTENT_VAR="kept"');
+        const result = await execSshCommandWithConnection(
+          persistentManager,
+          'echo "${SSH_MCP_PERSISTENT_VAR:-missing}"'
+        );
+
+        expect((result.content[0] as any).text.trim()).toBe('kept');
+      } finally {
+        persistentManager.close();
+      }
+    }, 30000);
   });
 
   describe('Connection Lifecycle', () => {
@@ -370,4 +402,3 @@ describe('SSHConnectionManager', () => {
     }, 30000);
   });
 });
-
