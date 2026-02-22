@@ -5,8 +5,13 @@ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { Client, ClientChannel } from 'ssh2';
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import * as os from 'os';
 
-// Example usage: node build/index.js --host=1.2.3.4 --port=22 --user=root --password=pass --key=path/to/key --timeout=5000 --executionMode=persistent-shell --disableSudo
+// Example usage:
+//   single-host: node build/index.js --host=1.2.3.4 --port=22 --user=root --key=~/.ssh/id_ed25519 --timeout=5000
+//   multi-host:  node build/index.js --config   (reads ~/.ssh/config, exposes all Host blocks marked with `# MCP yes`)
 function parseArgv() {
   const args = process.argv.slice(2);
   const config: Record<string, string | null> = {};
@@ -27,6 +32,12 @@ function parseArgv() {
 const isTestMode = process.env.SSH_MCP_TEST === '1';
 const isCliEnabled = process.env.SSH_MCP_DISABLE_MAIN !== '1';
 const argvConfig = (isCliEnabled || isTestMode) ? parseArgv() : {} as Record<string, string>;
+
+// multi-host mode: --config flag (with optional value for custom path), no --host required
+const CONFIG_MODE = argvConfig.config !== undefined;
+const CONFIG_FILE = (typeof argvConfig.config === 'string' && argvConfig.config.length > 0)
+  ? argvConfig.config
+  : path.join(os.homedir(), '.ssh', 'config');
 
 const HOST = argvConfig.host;
 const PORT = argvConfig.port ? parseInt(argvConfig.port) : 22;
@@ -56,6 +67,148 @@ const MAX_CHARS = (() => {
   return 1000;
 })();
 
+// ---- SSH config file parser ----
+
+export interface SshConfigHostEntry {
+  // first alias in the Host line; used as tool name suffix
+  alias: string;
+  // all aliases from the Host line
+  aliases: string[];
+  hostname: string;
+  port: number;
+  user: string;
+  identityFile?: string;
+  // MCP-specific overrides parsed from `# MCP-xxx` comments
+  mcpEnabled: boolean;
+  mcpTimeout?: number;
+  mcpMaxChars?: number | typeof Infinity;
+  mcpDisableSudo?: boolean;
+  mcpKey?: string;
+  mcpExecutionMode?: string;
+}
+
+function parseMaxCharsValue(raw: string): number | typeof Infinity {
+  const lowered = raw.trim().toLowerCase();
+  if (lowered === 'none') return Infinity;
+  const n = parseInt(raw);
+  if (isNaN(n) || n <= 0) return Infinity;
+  return n;
+}
+
+export function parseSshConfig(content: string): SshConfigHostEntry[] {
+  const entries: SshConfigHostEntry[] = [];
+  const lines = content.split('\n');
+
+  let currentAliases: string[] | null = null;
+  let currentProps: Record<string, string> = {};
+  let currentMcp: Partial<SshConfigHostEntry> & { mcpEnabled: boolean } = { mcpEnabled: false };
+  // pending comment lines between/before Host blocks
+  let pendingComments: string[] = [];
+
+  const flushEntry = () => {
+    if (!currentAliases) return;
+    if (!currentMcp.mcpEnabled) {
+      currentAliases = null;
+      currentProps = {};
+      currentMcp = { mcpEnabled: false };
+      pendingComments = [];
+      return;
+    }
+    const hostname = currentProps.hostname || currentAliases[0];
+    const port = currentProps.port ? parseInt(currentProps.port) : 22;
+    const user = currentProps.user || '';
+    const identityFile = currentProps.identityfile;
+    entries.push({
+      alias: currentAliases[0],
+      aliases: currentAliases,
+      hostname,
+      port,
+      user,
+      identityFile,
+      ...currentMcp,
+      mcpEnabled: true,
+    });
+    currentAliases = null;
+    currentProps = {};
+    currentMcp = { mcpEnabled: false };
+    pendingComments = [];
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+
+    // skip blank lines
+    if (line === '') {
+      pendingComments = [];
+      continue;
+    }
+
+    // Host line starts a new block
+    if (/^Host\s+/i.test(line)) {
+      flushEntry();
+      const aliases = line.replace(/^Host\s+/i, '').trim().split(/\s+/);
+      // skip wildcard-only blocks
+      if (aliases.every(a => a === '*')) {
+        currentAliases = null;
+        continue;
+      }
+      currentAliases = aliases;
+      pendingComments = [];
+      continue;
+    }
+
+    // MCP-specific comment directives (case-insensitive)
+    if (line.startsWith('#')) {
+      const commentBody = line.slice(1).trim();
+      const mcpMatch = commentBody.match(/^MCP(?:-(\S+))?\s*(.*)/i);
+      if (mcpMatch) {
+        const directive = (mcpMatch[1] || '').toLowerCase();
+        const value = mcpMatch[2].trim();
+        if (!directive || directive === 'yes' || directive === 'true' || directive === 'enable') {
+          // `# MCP yes` or `# MCP` alone enables the host
+          if (value === '' || /^(yes|true|1)$/i.test(value) || directive === '') {
+            currentMcp.mcpEnabled = true;
+          }
+        } else if (directive === 'key') {
+          currentMcp.mcpKey = value.replace(/^~/, os.homedir());
+        } else if (directive === 'timeout') {
+          const n = parseInt(value);
+          if (!isNaN(n)) currentMcp.mcpTimeout = n;
+        } else if (directive === 'maxchars') {
+          currentMcp.mcpMaxChars = parseMaxCharsValue(value);
+        } else if (directive === 'disablesudo') {
+          currentMcp.mcpDisableSudo = true;
+        } else if (directive === 'executionmode') {
+          currentMcp.mcpExecutionMode = value;
+        }
+      }
+      pendingComments.push(line);
+      continue;
+    }
+
+    // Regular SSH config directive inside a Host block
+    if (currentAliases) {
+      const match = line.match(/^(\S+)\s+(.*)/);
+      if (match) {
+        currentProps[match[1].toLowerCase()] = match[2].trim();
+      }
+    }
+  }
+
+  flushEntry();
+  return entries;
+}
+
+export async function loadSshConfigEntries(configFile: string): Promise<SshConfigHostEntry[]> {
+  let content: string;
+  try {
+    content = await fs.readFile(configFile, 'utf8');
+  } catch (err: any) {
+    throw new Error(`Cannot read SSH config file ${configFile}: ${err.message}`);
+  }
+  return parseSshConfig(content);
+}
+
 export type SSHExecutionMode = 'exec' | 'persistent-shell';
 
 function parseExecutionMode(rawMode: string | null | undefined): SSHExecutionMode {
@@ -75,8 +228,11 @@ const EXECUTION_MODE = parseExecutionMode(argvConfig.executionMode);
 
 function validateConfig(config: Record<string, string | null>) {
   const errors = [];
-  if (!config.host) errors.push('Missing required --host');
-  if (!config.user) errors.push('Missing required --user');
+  // in multi-host config mode, --host and --user are not required
+  if (!CONFIG_MODE) {
+    if (!config.host) errors.push('Missing required --host');
+    if (!config.user) errors.push('Missing required --user');
+  }
   if (config.port && isNaN(Number(config.port))) errors.push('Invalid --port');
   if (config.executionMode) {
     try {
@@ -745,6 +901,10 @@ export class SSHConnectionManager {
 let connectionManager: SSHConnectionManager | null = null;
 let cachedPrivateKey: string | null = null;
 
+async function readKeyFile(keyPath: string): Promise<string> {
+  return fs.readFile(keyPath.replace(/^~/, os.homedir()), 'utf8');
+}
+
 async function buildSshConfigFromCli(): Promise<SSHConfig> {
   if (!HOST || !USER) {
     throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
@@ -761,8 +921,7 @@ async function buildSshConfigFromCli(): Promise<SSHConfig> {
     sshConfig.password = PASSWORD;
   } else if (KEY) {
     if (cachedPrivateKey === null) {
-      const fs = await import('fs/promises');
-      cachedPrivateKey = await fs.readFile(KEY, 'utf8');
+      cachedPrivateKey = await readKeyFile(KEY);
     }
     sshConfig.privateKey = cachedPrivateKey;
   }
@@ -783,6 +942,15 @@ async function getOrCreateConnectionManager(): Promise<SSHConnectionManager> {
   return connectionManager;
 }
 
+// ---- tool name helpers ----
+
+// convert alias to a safe tool name suffix: only alphanumeric + underscore
+function aliasToToolSuffix(alias: string): string {
+  return alias.replace(/[^a-zA-Z0-9]/g, '_');
+}
+
+// ---- MCP server ----
+
 const server = new McpServer({
   name: 'SSH MCP Server',
   version: '1.5.0',
@@ -792,109 +960,175 @@ const server = new McpServer({
   },
 });
 
-server.tool(
-  "exec",
-  "Execute a shell command on the remote SSH server and return the output.",
-  {
-    command: z.string().describe("Shell command to execute on the remote SSH server"),
-    description: z.string().optional().describe("Optional description of what this command will do"),
-  },
-  async ({ command, description }) => {
-    // Sanitize command input
-    const sanitizedCommand = sanitizeCommand(command);
+// register exec + sudo-exec tools for a single connection manager (single-host mode)
+function registerSingleHostTools(
+  mgr: () => Promise<SSHConnectionManager>,
+  toolTimeout: number,
+  maxCharsLimit: number | typeof Infinity,
+  disableSudo: boolean,
+  suPassword?: string,
+  sudoPassword?: string,
+  toolSuffix = '',
+  hostLabel = 'the remote SSH server',
+) {
+  const execToolName = toolSuffix ? `exec__${toolSuffix}` : 'exec';
+  const sudoToolName = toolSuffix ? `sudo_exec__${toolSuffix}` : 'sudo-exec';
 
-    try {
-      const manager = await getOrCreateConnectionManager();
-      await manager.ensureConnected();
-
-      // If a suPassword was provided, explicitly wait for elevation before executing.
-      // This is critical: ensureElevated is idempotent and will return immediately if
-      // already elevated, so this ensures we have a su shell before we try to use it.
-      if (manager.getSuPassword()) {
-        try {
-          const elevationPromise = manager.ensureElevated();
-          // Add a short timeout for elevation to complete
-          await Promise.race([
-            elevationPromise,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Elevation timeout')), 5000))
-          ]);
-        } catch (err) {
-          // Log but don't fail; fall back to non-elevated execution if elevation times out
-        }
-      }
-
-      // Append description as comment if provided
-      const commandWithDescription = description
-        ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
-        : sanitizedCommand;
-
-      const result = await execSshCommandWithConnection(manager, commandWithDescription);
-      return result;
-    } catch (err: any) {
-      // Wrap unexpected errors
-      if (err instanceof McpError) throw err;
-      throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
+  const checkMaxChars = (cmd: string) => {
+    if (Number.isFinite(maxCharsLimit) && cmd.length > (maxCharsLimit as number)) {
+      throw new McpError(ErrorCode.InvalidParams, `Command is too long (max ${maxCharsLimit} characters)`);
     }
-  }
-);
+  };
 
-// Expose sudo-exec tool unless explicitly disabled
-if (!DISABLE_SUDO) {
   server.tool(
-    "sudo-exec",
-    "Execute a shell command on the remote SSH server using sudo. Will use sudo password if provided, otherwise assumes passwordless sudo.",
+    execToolName,
+    `Execute a shell command on ${hostLabel} and return the output.`,
     {
-      command: z.string().describe("Shell command to execute with sudo on the remote SSH server"),
+      command: z.string().describe(`Shell command to execute on ${hostLabel}`),
       description: z.string().optional().describe("Optional description of what this command will do"),
     },
     async ({ command, description }) => {
       const sanitizedCommand = sanitizeCommand(command);
+      checkMaxChars(sanitizedCommand);
 
       try {
-        const manager = await getOrCreateConnectionManager();
+        const manager = await mgr();
         await manager.ensureConnected();
 
-        // If suPassword or sudoPassword were provided on this call but the
-        // existing connection manager was created earlier without them,
-        // update the manager's values so the subsequent sudo-exec call uses
-        // the latest passwords.
-        if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
-          await manager.setSuPassword(sanitizePassword(SUPASSWORD));
-        }
-        if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) {
-          manager.setSudoPassword(sanitizePassword(SUDOPASSWORD));
+        if (manager.getSuPassword()) {
+          try {
+            await Promise.race([
+              manager.ensureElevated(),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('Elevation timeout')), 5000))
+            ]);
+          } catch (_err) {
+            // fall back to non-elevated execution
+          }
         }
 
-        let wrapped: string;
-        const sudoPassword = manager.getSudoPassword();
-
-        // Append description as comment if provided
         const commandWithDescription = description
           ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
           : sanitizedCommand;
 
-        if (!sudoPassword) {
-          // No password provided, use -n to fail if sudo requires a password
-          wrapped = `sudo -n sh -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
-        } else {
-          // Password provided — pipe it into sudo using printf. This avoids complex
-          // PTY/stdin handling on the SSH channel and is simpler and more reliable.
-          const pwdEscaped = sudoPassword.replace(/'/g, "'\\''");
-          wrapped = `printf '%s\\n' '${pwdEscaped}' | sudo -p "" -S sh -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
-        }
-
-        return await execSshCommandWithConnection(manager, wrapped);
+        return await execSshCommandWithConnection(manager, commandWithDescription, undefined, toolTimeout);
       } catch (err: any) {
         if (err instanceof McpError) throw err;
         throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
       }
     }
   );
+
+  if (!disableSudo) {
+    server.tool(
+      sudoToolName,
+      `Execute a shell command on ${hostLabel} using sudo. Will use sudo password if provided, otherwise assumes passwordless sudo.`,
+      {
+        command: z.string().describe(`Shell command to execute with sudo on ${hostLabel}`),
+        description: z.string().optional().describe("Optional description of what this command will do"),
+      },
+      async ({ command, description }) => {
+        const sanitizedCommand = sanitizeCommand(command);
+        checkMaxChars(sanitizedCommand);
+
+        try {
+          const manager = await mgr();
+          await manager.ensureConnected();
+
+          if (suPassword !== null && suPassword !== undefined) {
+            await manager.setSuPassword(sanitizePassword(suPassword));
+          }
+          if (sudoPassword !== null && sudoPassword !== undefined) {
+            manager.setSudoPassword(sanitizePassword(sudoPassword));
+          }
+
+          const sudoPwd = manager.getSudoPassword();
+          const commandWithDescription = description
+            ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
+            : sanitizedCommand;
+
+          let wrapped: string;
+          if (!sudoPwd) {
+            wrapped = `sudo -n sh -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
+          } else {
+            const pwdEscaped = sudoPwd.replace(/'/g, "'\\''");
+            wrapped = `printf '%s\\n' '${pwdEscaped}' | sudo -p "" -S sh -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
+          }
+
+          return await execSshCommandWithConnection(manager, wrapped, undefined, toolTimeout);
+        } catch (err: any) {
+          if (err instanceof McpError) throw err;
+          throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
+        }
+      }
+    );
+  }
+}
+
+// cache of per-alias connection managers (multi-host mode)
+const multiHostManagers = new Map<string, SSHConnectionManager>();
+
+async function buildManagerFromConfigEntry(entry: SshConfigHostEntry): Promise<SSHConnectionManager> {
+  const keyPath = entry.mcpKey || entry.identityFile;
+  let privateKey: string | undefined;
+  if (keyPath) {
+    privateKey = await readKeyFile(keyPath);
+  }
+  const sshCfg: SSHConfig = {
+    host: entry.hostname,
+    port: entry.port,
+    username: entry.user,
+    privateKey,
+    executionMode: entry.mcpExecutionMode
+      ? parseExecutionMode(entry.mcpExecutionMode)
+      : 'exec',
+  };
+  return new SSHConnectionManager(sshCfg);
+}
+
+async function registerMultiHostTools(configFile: string) {
+  const entries = await loadSshConfigEntries(configFile);
+  if (entries.length === 0) {
+    console.error(`No MCP-enabled hosts found in ${configFile}. Add \`# MCP yes\` inside a Host block to enable it.`);
+    return;
+  }
+
+  for (const entry of entries) {
+    const suffix = aliasToToolSuffix(entry.alias);
+    const timeout = entry.mcpTimeout ?? DEFAULT_TIMEOUT;
+    const maxChars = entry.mcpMaxChars ?? MAX_CHARS;
+    const disableSudo = entry.mcpDisableSudo ?? false;
+    const hostLabel = `${entry.alias} (${entry.user}@${entry.hostname}:${entry.port})`;
+
+    // lazy manager per alias
+    const getManager = async () => {
+      let mgr = multiHostManagers.get(entry.alias);
+      if (!mgr) {
+        mgr = await buildManagerFromConfigEntry(entry);
+        multiHostManagers.set(entry.alias, mgr);
+      }
+      return mgr;
+    };
+
+    registerSingleHostTools(getManager, timeout, maxChars, disableSudo, undefined, undefined, suffix, hostLabel);
+    console.error(`Registered tools for host: ${hostLabel} (exec__${suffix}${disableSudo ? '' : `, sudo_exec__${suffix}`})`);
+  }
+}
+
+// in single-host mode, register using the global connection manager
+if (!CONFIG_MODE) {
+  registerSingleHostTools(
+    getOrCreateConnectionManager,
+    DEFAULT_TIMEOUT,
+    MAX_CHARS,
+    DISABLE_SUDO,
+    SUPASSWORD ?? undefined,
+    SUDOPASSWORD ?? undefined,
+  );
 }
 
 // New function that uses persistent connection
-export async function execSshCommandWithConnection(manager: SSHConnectionManager, command: string, stdin?: string): Promise<{ [x: string]: unknown; content: ({ [x: string]: unknown; type: "text"; text: string; } | { [x: string]: unknown; type: "image"; data: string; mimeType: string; } | { [x: string]: unknown; type: "audio"; data: string; mimeType: string; } | { [x: string]: unknown; type: "resource"; resource: any; })[] }> {
-  const result = await manager.executeCommand(command, stdin, DEFAULT_TIMEOUT);
+export async function execSshCommandWithConnection(manager: SSHConnectionManager, command: string, stdin?: string, timeoutMs = DEFAULT_TIMEOUT): Promise<{ [x: string]: unknown; content: ({ [x: string]: unknown; type: "text"; text: string; } | { [x: string]: unknown; type: "image"; data: string; mimeType: string; } | { [x: string]: unknown; type: "audio"; data: string; mimeType: string; } | { [x: string]: unknown; type: "resource"; resource: any; })[] }> {
+  const result = await manager.executeCommand(command, stdin, timeoutMs);
   const hasErrorOutput = result.stderr.trim().length > 0;
   const nonZeroExitCode = typeof result.code === 'number' && result.code !== 0;
 
@@ -1002,11 +1236,16 @@ export async function execSshCommand(sshConfig: any, command: string, stdin?: st
 }
 
 async function main() {
+  if (CONFIG_MODE) {
+    // multi-host mode: read SSH config and register tools for all MCP-enabled hosts
+    await registerMultiHostTools(CONFIG_FILE);
+  }
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("SSH MCP Server running on stdio");
+  console.error(`SSH MCP Server running on stdio${CONFIG_MODE ? ` (multi-host, config: ${CONFIG_FILE})` : ''}`);
 
-  if (EXECUTION_MODE === 'persistent-shell') {
+  if (!CONFIG_MODE && EXECUTION_MODE === 'persistent-shell') {
     const manager = await getOrCreateConnectionManager();
     await manager.ensureConnected();
     console.error("persistent shell mode enabled, SSH session preconnected");
@@ -1019,6 +1258,10 @@ async function main() {
       connectionManager.close();
       connectionManager = null;
     }
+    for (const mgr of multiHostManagers.values()) {
+      mgr.close();
+    }
+    multiHostManagers.clear();
     process.exit(0);
   };
 
@@ -1027,6 +1270,9 @@ async function main() {
   process.on('exit', () => {
     if (connectionManager) {
       connectionManager.close();
+    }
+    for (const mgr of multiHostManagers.values()) {
+      mgr.close();
     }
   });
 }

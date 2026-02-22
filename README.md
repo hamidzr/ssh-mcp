@@ -36,35 +36,31 @@
 - Execute shell commands on remote Linux and Windows systems
 - Secure authentication via password or SSH key
 - Built with TypeScript and the official MCP SDK
+- **Multi-host mode** - reads `~/.ssh/config` and exposes all opted-in hosts as separate tools in a single process
 - **Configurable timeout protection** with automatic process abortion
 - **Graceful timeout handling** - attempts to kill hanging processes before closing connections
 - **Execution mode selection** - choose per-command exec channels or a shared persistent shell session
 
 ### Tools
 
-- `exec`: Execute a shell command on the remote server
-  - **Parameters:**
-    - `command` (required): Shell command to execute on the remote SSH server
-    - `description` (optional): Optional description of what this command will do (appended as a comment)
-  - **Timeout Configuration:**
+**Single-host mode** (default):
 
+- `exec`: Execute a shell command on the remote server
 - `sudo-exec`: Execute a shell command with sudo elevation
-  - **Parameters:**
-    - `command` (required): Shell command to execute as root using sudo
-    - `description` (optional): Optional description of what this command will do (appended as a comment)
-  - **Notes:**
-    - Requires `--sudoPassword` to be set for password-protected sudo
-    - Can be disabled by passing the `--disableSudo` flag at startup if sudo access is not needed or not available
-    - For persistent root access, consider using `--suPassword` instead which establishes a root shell
-    - Tool will not be available at all if server is started with `--disableSudo`
-  - **Timeout Configuration:**
-    - Timeout is configured via command line argument `--timeout` (in milliseconds)
-    - Default timeout: 60000ms (1 minute)
-    - When a command times out, the server automatically attempts to abort the running process before closing the connection
-  - **Max Command Length Configuration:**
-    - Max command characters are configured via `--maxChars`
-    - Default: `1000`
-    - No-limit mode: set `--maxChars=none` or any `<= 0` value (e.g. `--maxChars=0`)
+
+**Multi-host mode** (`--config`): tools are namespaced per host alias:
+
+- `exec__<alias>`: Execute a shell command on the named host
+- `sudo_exec__<alias>`: Execute a shell command with sudo on the named host
+
+All `exec` / `exec__*` tools accept:
+- `command` (required): Shell command to execute
+- `description` (optional): Appended as a comment for audit trails
+
+**Configuration:**
+- Timeout: `--timeout` (ms, default 60000)
+- Max command length: `--maxChars` (default 1000; use `none` or `0` for no limit)
+- Disable sudo tool: `--disableSudo`
 
 ## Installation
 
@@ -82,109 +78,115 @@
 
 You can configure your IDE or LLM like Cursor, Windsurf, Claude Desktop to use this MCP Server.
 
+### Multi-host mode (recommended)
+
+One process, all your servers - controlled entirely from `~/.ssh/config`.
+
+**Step 1 - Mark hosts in `~/.ssh/config`:**
+
+```ssh-config
+Host beryl
+  HostName beryl.prv
+  User root
+  IdentityFile ~/.ssh/id_ed25519
+  # MCP yes
+
+Host va
+  HostName va.vps.latentbyte.com
+  User hmd
+  IdentityFile ~/.ssh/id_ed25519
+  # MCP yes
+  # MCP-timeout 30000
+  # MCP-maxChars none
+
+Host old-box
+  HostName old.example.com
+  User admin
+  # host is NOT enabled for agents - no `# MCP yes`
+```
+
+**Available `# MCP-*` directives** (all optional, per Host block):
+
+| Directive | Example | Description |
+|---|---|---|
+| `# MCP yes` | | Enable this host for agents (required to opt in) |
+| `# MCP-key <path>` | `# MCP-key ~/.ssh/other_key` | Override key path (falls back to `IdentityFile`) |
+| `# MCP-timeout <ms>` | `# MCP-timeout 30000` | Per-host command timeout (default: 60000) |
+| `# MCP-maxChars <n\|none>` | `# MCP-maxChars none` | Per-host max command length (default: 1000) |
+| `# MCP-disableSudo` | | Disable `sudo_exec__<alias>` for this host |
+| `# MCP-executionMode <mode>` | `# MCP-executionMode persistent-shell` | Execution strategy for this host |
+
+**Step 2 - Add a single MCP server entry:**
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp": {
+      "command": "npx",
+      "args": ["--yes", "--package=ssh-mcp", "ssh-mcp", "--config"]
+    }
+  }
+}
+```
+
+To use a non-default config file: `--config=/path/to/ssh_config`
+
+This registers tools like `exec__beryl`, `sudo_exec__beryl`, `exec__va`, `sudo_exec__va` automatically.
+
+---
+
+### Single-host mode (one server per host)
+
+Pass `--host` to target a specific server. Tools are named `exec` and `sudo-exec`.
+
 **Required Parameters:**
-- `host`: Hostname or IP of the Linux or Windows server
+- `host`: Hostname or IP of the remote server
 - `user`: SSH username
 
 **Optional Parameters:**
 - `port`: SSH port (default: 22)
 - `password`: SSH password (or use `key` for key-based auth)
 - `key`: Path to private SSH key
-- `sudoPassword`: Password for sudo elevation (when executing commands with sudo)
-- `suPassword`: Password for su elevation (when you need a persistent root shell)
-- `timeout`: Command execution timeout in milliseconds (default: 60000ms = 1 minute)
-- `maxChars`: Maximum allowed characters for the `command` input (default: 1000). Use `none` or `0` to disable the limit.
-- `disableSudo`: Flag to disable the `sudo-exec` tool completely. Useful when sudo access is not needed or not available.
-- `executionMode`: How commands run after connect. Default: `exec`. Supported values:
-  - `exec`: Open a new SSH execution channel per command (default)
-  - `shell` / `persistent-shell`: Keep one shell channel open and run all commands through it
+- `sudoPassword`: Password for sudo elevation
+- `suPassword`: Password for `su -` elevation (persistent root shell)
+- `timeout`: Command execution timeout in milliseconds (default: 60000)
+- `maxChars`: Max command characters (default: 1000; use `none` or `0` to disable)
+- `disableSudo`: Flag to disable the `sudo-exec` tool completely
+- `executionMode`: `exec` (default) or `persistent-shell`
 
-
-```commandline
+```json
 {
-    "mcpServers": {
-        "ssh-mcp": {
-            "command": "npx",
-            "args": [
-                "ssh-mcp",
-                "-y",
-                "--",
-                "--host=1.2.3.4",
-                "--port=22",
-                "--user=root",
-                "--password=pass",
-                "--key=path/to/key",
-                "--timeout=30000",
-                "--maxChars=none",
-                "--executionMode=persistent-shell"
-            ]
-        }
+  "mcpServers": {
+    "ssh-mcp-beryl": {
+      "command": "npx",
+      "args": [
+        "--yes", "--package=ssh-mcp", "ssh-mcp",
+        "--host=beryl.prv",
+        "--port=22",
+        "--user=root",
+        "--key=/Users/you/.ssh/id_ed25519",
+        "--timeout=30000",
+        "--maxChars=none"
+      ]
     }
+  }
 }
 ```
 
 ### Claude Code
 
-You can add this MCP server to Claude Code using the `claude mcp add` command. This is the recommended method for Claude Code.
-
-**Basic Installation:**
+**Multi-host (recommended) - add once, control all your servers:**
 
 ```bash
-claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=YOUR_HOST --user=YOUR_USER --password=YOUR_PASSWORD
+claude mcp add --transport stdio ssh-mcp -- npx --yes --package=ssh-mcp ssh-mcp --config
 ```
 
-**Installation Examples:**
+Then mark hosts in `~/.ssh/config` with `# MCP yes` as shown above.
 
-**With Password Authentication:**
+**Single-host:**
+
 ```bash
-claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=192.168.1.100 --port=22 --user=admin --password=your_password
-```
-
-**With SSH Key Authentication:**
-```bash
-claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=example.com --user=root --key=/path/to/private/key
-```
-
-**With Custom Timeout and No Character Limit:**
-```bash
-claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=192.168.1.100 --user=admin --password=your_password --timeout=120000 --maxChars=none
-```
-
-**With Persistent Shell Mode (single shared remote shell):**
-```bash
-claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=192.168.1.100 --user=admin --password=your_password --executionMode=persistent-shell
-```
-
-**With Sudo and Su Support:**
-```bash
-claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=192.168.1.100 --user=admin --password=your_password --sudoPassword=sudo_pass --suPassword=root_pass
-```
-
-**Installation Scopes:**
-
-You can specify the scope when adding the server:
-
-- **Local scope** (default): For personal use in the current project
-  ```bash
-  claude mcp add --transport stdio ssh-mcp --scope local -- npx -y ssh-mcp -- --host=YOUR_HOST --user=YOUR_USER --password=YOUR_PASSWORD
-  ```
-
-- **Project scope**: Share with your team via `.mcp.json` file
-  ```bash
-  claude mcp add --transport stdio ssh-mcp --scope project -- npx -y ssh-mcp -- --host=YOUR_HOST --user=YOUR_USER --password=YOUR_PASSWORD
-  ```
-
-- **User scope**: Available across all your projects
-  ```bash
-  claude mcp add --transport stdio ssh-mcp --scope user -- npx -y ssh-mcp -- --host=YOUR_HOST --user=YOUR_USER --password=YOUR_PASSWORD
-  ```
-
-
-**Verify Installation:**
-
-After adding the server, restart Claude Code and ask Cascade to execute a command:
-```
-"Can you run 'ls -la' on the remote server?"
+claude mcp add --transport stdio ssh-mcp -- npx --yes --package=ssh-mcp ssh-mcp -- --host=YOUR_HOST --user=YOUR_USER --key=/path/to/key
 ```
 
 For more information about MCP in Claude Code, see the [official documentation](https://docs.claude.com/en/docs/claude-code/mcp).
