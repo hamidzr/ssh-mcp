@@ -905,6 +905,25 @@ async function readKeyFile(keyPath: string): Promise<string> {
   return fs.readFile(keyPath.replace(/^~/, os.homedir()), 'utf8');
 }
 
+// default key paths SSH itself tries, in order
+const DEFAULT_SSH_KEY_PATHS = [
+  '~/.ssh/id_ed25519',
+  '~/.ssh/id_ecdsa',
+  '~/.ssh/id_rsa',
+  '~/.ssh/id_dsa',
+];
+
+async function readFirstAvailableKey(candidates: string[]): Promise<string | undefined> {
+  for (const p of candidates) {
+    try {
+      return await readKeyFile(p);
+    } catch (_e) {
+      // not found, try next
+    }
+  }
+  return undefined;
+}
+
 async function buildSshConfigFromCli(): Promise<SSHConfig> {
   if (!HOST || !USER) {
     throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
@@ -1068,10 +1087,16 @@ function registerSingleHostTools(
 const multiHostManagers = new Map<string, SSHConnectionManager>();
 
 async function buildManagerFromConfigEntry(entry: SshConfigHostEntry): Promise<SSHConnectionManager> {
-  const keyPath = entry.mcpKey || entry.identityFile;
   let privateKey: string | undefined;
-  if (keyPath) {
-    privateKey = await readKeyFile(keyPath);
+  if (entry.mcpKey) {
+    // explicit MCP-key directive takes priority
+    privateKey = await readKeyFile(entry.mcpKey);
+  } else if (entry.identityFile) {
+    // IdentityFile from the Host block
+    privateKey = await readKeyFile(entry.identityFile);
+  } else {
+    // fall back to default key files, same order SSH itself uses
+    privateKey = await readFirstAvailableKey(DEFAULT_SSH_KEY_PATHS);
   }
   const sshCfg: SSHConfig = {
     host: entry.hostname,
