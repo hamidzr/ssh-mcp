@@ -95,6 +95,11 @@ function parseMaxCharsValue(raw: string): number | typeof Infinity {
   return n;
 }
 
+// global MCP defaults from top-level (pre-Host) comments
+type GlobalMcpDefaults = Pick<SshConfigHostEntry,
+  'mcpTimeout' | 'mcpMaxChars' | 'mcpDisableSudo' | 'mcpKey' | 'mcpExecutionMode'
+>;
+
 export function parseSshConfig(content: string): SshConfigHostEntry[] {
   const entries: SshConfigHostEntry[] = [];
   const lines = content.split('\n');
@@ -102,6 +107,8 @@ export function parseSshConfig(content: string): SshConfigHostEntry[] {
   let currentAliases: string[] | null = null;
   let currentProps: Record<string, string> = {};
   let currentMcp: Partial<SshConfigHostEntry> & { mcpEnabled: boolean } = { mcpEnabled: false };
+  // global defaults parsed from MCP directives before any Host block
+  const globalMcp: Partial<GlobalMcpDefaults> = {};
   // pending comment lines between/before Host blocks
   let pendingComments: string[] = [];
 
@@ -125,6 +132,8 @@ export function parseSshConfig(content: string): SshConfigHostEntry[] {
       port,
       user,
       identityFile,
+      // global defaults applied first; per-host settings override them
+      ...globalMcp,
       ...currentMcp,
       mcpEnabled: true,
     });
@@ -132,6 +141,25 @@ export function parseSshConfig(content: string): SshConfigHostEntry[] {
     currentProps = {};
     currentMcp = { mcpEnabled: false };
     pendingComments = [];
+  };
+
+  const applyMcpDirective = (
+    directive: string,
+    value: string,
+    target: Partial<GlobalMcpDefaults> | (Partial<SshConfigHostEntry> & { mcpEnabled: boolean }),
+  ) => {
+    if (directive === 'key') {
+      target.mcpKey = value.replace(/^~/, os.homedir());
+    } else if (directive === 'timeout') {
+      const n = parseInt(value);
+      if (!isNaN(n)) target.mcpTimeout = n;
+    } else if (directive === 'maxchars') {
+      target.mcpMaxChars = parseMaxCharsValue(value);
+    } else if (directive === 'disablesudo') {
+      target.mcpDisableSudo = true;
+    } else if (directive === 'executionmode') {
+      target.mcpExecutionMode = value;
+    }
   };
 
   for (const rawLine of lines) {
@@ -165,21 +193,16 @@ export function parseSshConfig(content: string): SshConfigHostEntry[] {
         const directive = (mcpMatch[1] || '').toLowerCase();
         const value = mcpMatch[2].trim();
         if (!directive || directive === 'yes' || directive === 'true' || directive === 'enable') {
-          // `# MCP yes` or `# MCP` alone enables the host
-          if (value === '' || /^(yes|true|1)$/i.test(value) || directive === '') {
+          // `# MCP yes` / `# MCP` enables only the current host, not globally
+          if (currentAliases && (value === '' || /^(yes|true|1)$/i.test(value) || directive === '')) {
             currentMcp.mcpEnabled = true;
           }
-        } else if (directive === 'key') {
-          currentMcp.mcpKey = value.replace(/^~/, os.homedir());
-        } else if (directive === 'timeout') {
-          const n = parseInt(value);
-          if (!isNaN(n)) currentMcp.mcpTimeout = n;
-        } else if (directive === 'maxchars') {
-          currentMcp.mcpMaxChars = parseMaxCharsValue(value);
-        } else if (directive === 'disablesudo') {
-          currentMcp.mcpDisableSudo = true;
-        } else if (directive === 'executionmode') {
-          currentMcp.mcpExecutionMode = value;
+        } else if (currentAliases === null) {
+          // before any Host block: treat as global default
+          applyMcpDirective(directive, value, globalMcp);
+        } else {
+          // inside a Host block: per-host override
+          applyMcpDirective(directive, value, currentMcp);
         }
       }
       pendingComments.push(line);

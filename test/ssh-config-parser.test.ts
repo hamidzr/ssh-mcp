@@ -156,4 +156,103 @@ Host meh
     const entries = parseSshConfig(config);
     expect(entries).toHaveLength(0);
   });
+
+  describe('global MCP defaults (pre-Host directives)', () => {
+    const GLOBAL_CONFIG = `
+# MCP-timeout 30000
+# MCP-maxChars none
+
+Host hostA
+  HostName a.example.com
+  User alice
+  # MCP yes
+
+Host hostB
+  HostName b.example.com
+  User bob
+  # MCP yes
+  # MCP-timeout 5000
+
+Host hostC
+  HostName c.example.com
+  User carol
+  # MCP yes
+  # MCP-maxChars 500
+`;
+
+    it('applies global timeout to hosts without a per-host override', () => {
+      const entries = parseSshConfig(GLOBAL_CONFIG);
+      const a = entries.find(e => e.alias === 'hostA')!;
+      expect(a.mcpTimeout).toBe(30000);
+    });
+
+    it('per-host timeout overrides global default', () => {
+      const entries = parseSshConfig(GLOBAL_CONFIG);
+      const b = entries.find(e => e.alias === 'hostB')!;
+      expect(b.mcpTimeout).toBe(5000);
+    });
+
+    it('applies global maxChars none as Infinity to hosts without override', () => {
+      const entries = parseSshConfig(GLOBAL_CONFIG);
+      const a = entries.find(e => e.alias === 'hostA')!;
+      expect(a.mcpMaxChars).toBe(Infinity);
+    });
+
+    it('per-host maxChars overrides global default', () => {
+      const entries = parseSshConfig(GLOBAL_CONFIG);
+      const c = entries.find(e => e.alias === 'hostC')!;
+      expect(c.mcpMaxChars).toBe(500);
+    });
+
+    it('global # MCP yes does not auto-enable hosts', () => {
+      const config = `
+# MCP yes
+
+Host silent
+  HostName silent.example.com
+  User u
+`;
+      const entries = parseSshConfig(config);
+      expect(entries).toHaveLength(0);
+    });
+
+    it('global MCP-key applies to hosts without a per-host key', () => {
+      const config = `
+# MCP-key /global/.ssh/key
+
+Host srv
+  HostName srv.example.com
+  User u
+  # MCP yes
+`;
+      const entries = parseSshConfig(config);
+      expect(entries[0].mcpKey).toBe('/global/.ssh/key');
+    });
+
+    it('global MCP-disableSudo applies to all MCP hosts', () => {
+      const config = `
+# MCP-disableSudo
+
+Host srv
+  HostName srv.example.com
+  User u
+  # MCP yes
+`;
+      const entries = parseSshConfig(config);
+      expect(entries[0].mcpDisableSudo).toBe(true);
+    });
+
+    it('global MCP-executionMode applies to all MCP hosts', () => {
+      const config = `
+# MCP-executionMode persistent-shell
+
+Host srv
+  HostName srv.example.com
+  User u
+  # MCP yes
+`;
+      const entries = parseSshConfig(config);
+      expect(entries[0].mcpExecutionMode).toBe('persistent-shell');
+    });
+  });
 });
