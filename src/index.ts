@@ -48,6 +48,7 @@ const SUDOPASSWORD = argvConfig.sudoPassword;
 const DISABLE_SUDO = argvConfig.disableSudo !== undefined;
 const KEY = argvConfig.key;
 const DEFAULT_TIMEOUT = argvConfig.timeout ? parseInt(argvConfig.timeout) : 60000; // 60 seconds default timeout
+const SHELL_PROBE_TIMEOUT = 10000;
 // Max characters configuration:
 // - Default: 1000 characters
 // - When set via --maxChars:
@@ -302,6 +303,30 @@ function sanitizePassword(password: string | undefined): string | undefined {
   return password;
 }
 
+// single-quote a value for POSIX shells
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+// prefer bash so agents get bash semantics regardless of the remote login shell (eg zsh skips word splitting)
+export const SHELL_PROBE_COMMAND = 'command -v bash || command -v sh';
+
+// login shells can print terminal noise around the probe output, keep the last absolute path line
+export function parseShellProbe(output: string): string | null {
+  const lines = output
+    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.trim())
+    .reverse();
+  return lines.find((line) => /^\/[\w./+-]+$/.test(line)) ?? null;
+}
+
+// null shell keeps the login shell, eg Windows hosts where the probe fails
+export function wrapWithShell(command: string, shellPath: string | null): string {
+  return shellPath ? `${shellPath} -c ${shellQuote(command)}` : command;
+}
+
 // Escape command for use in shell contexts (like pkill)
 export function escapeCommandForShell(command: string): string {
   // Replace single quotes with escaped single quotes
@@ -336,6 +361,7 @@ export class SSHConnectionManager {
   private isElevated = false;
   private persistentShell: ClientChannel | null = null;
   private persistentShellPromise: Promise<ClientChannel> | null = null;
+  private commandShellPromise: Promise<string | null> | null = null;
   private shellQueue: Promise<void> = Promise.resolve();
   private persistentStdoutCarry = '';
   private suStdoutCarry = '';
@@ -433,9 +459,9 @@ export class SSHConnectionManager {
       return this.persistentShellPromise;
     }
 
-    this.persistentShellPromise = new Promise((resolve, reject) => {
+    this.persistentShellPromise = this.getCommandShell().then((shellPath) => new Promise((resolve, reject) => {
       const conn = this.getConnection();
-      conn.exec('/bin/sh', (err: Error | undefined, stream: ClientChannel) => {
+      conn.exec(shellPath ?? '/bin/sh', (err: Error | undefined, stream: ClientChannel) => {
         if (err) {
           this.persistentShellPromise = null;
           reject(new McpError(ErrorCode.InternalError, `Failed to start persistent shell: ${err.message}`));
@@ -458,7 +484,7 @@ export class SSHConnectionManager {
         this.persistentShellPromise = null;
         resolve(stream);
       });
-    });
+    }));
 
     return this.persistentShellPromise;
   }
@@ -891,6 +917,19 @@ export class SSHConnectionManager {
     }
   }
 
+  // resolved once per manager; a failed probe is retried on the next command
+  async getCommandShell(): Promise<string | null> {
+    if (!this.commandShellPromise) {
+      this.commandShellPromise = this.executeWithExec(SHELL_PROBE_COMMAND, undefined, SHELL_PROBE_TIMEOUT)
+        .then((result) => (result.code === 0 ? parseShellProbe(result.stdout) : null))
+        .catch(() => {
+          this.commandShellPromise = null;
+          return null;
+        });
+    }
+    return this.commandShellPromise;
+  }
+
   async executeCommand(command: string, stdin?: string, timeoutMs = DEFAULT_TIMEOUT): Promise<CommandExecutionResult> {
     await this.ensureConnected();
 
@@ -902,7 +941,8 @@ export class SSHConnectionManager {
       return this.executeWithPersistentShell(command, timeoutMs);
     }
 
-    return this.executeWithExec(command, stdin, timeoutMs);
+    const shellPath = await this.getCommandShell();
+    return this.executeWithExec(wrapWithShell(command, shellPath), stdin, timeoutMs);
   }
 
   getConnection(): Client {
@@ -1024,7 +1064,7 @@ function registerSingleHostTools(
 
   server.tool(
     execToolName,
-    `Execute a shell command on ${hostLabel} and return the output.`,
+    `Execute a shell command on ${hostLabel} and return the output. Runs under bash (sh if bash is missing), not the login shell.`,
     {
       command: z.string().describe(`Shell command to execute on ${hostLabel}`),
       description: z.string().optional().describe("Optional description of what this command will do"),
@@ -1063,7 +1103,7 @@ function registerSingleHostTools(
   if (!disableSudo) {
     server.tool(
       sudoToolName,
-      `Execute a shell command on ${hostLabel} using sudo. Will use sudo password if provided, otherwise assumes passwordless sudo.`,
+      `Execute a shell command on ${hostLabel} using sudo. Runs under bash (sh if bash is missing). Will use sudo password if provided, otherwise assumes passwordless sudo.`,
       {
         command: z.string().describe(`Shell command to execute with sudo on ${hostLabel}`),
         description: z.string().optional().describe("Optional description of what this command will do"),
@@ -1084,16 +1124,17 @@ function registerSingleHostTools(
           }
 
           const sudoPwd = manager.getSudoPassword();
+          const sudoShell = (await manager.getCommandShell()) ?? 'sh';
           const commandWithDescription = description
             ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
             : sanitizedCommand;
 
           let wrapped: string;
           if (!sudoPwd) {
-            wrapped = `sudo -n sh -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
+            wrapped = `sudo -n ${sudoShell} -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
           } else {
             const pwdEscaped = sudoPwd.replace(/'/g, "'\\''");
-            wrapped = `printf '%s\\n' '${pwdEscaped}' | sudo -p "" -S sh -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
+            wrapped = `printf '%s\\n' '${pwdEscaped}' | sudo -p "" -S ${sudoShell} -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
           }
 
           return await execSshCommandWithConnection(manager, wrapped, undefined, toolTimeout);
