@@ -353,7 +353,10 @@ interface CommandExecutionResult {
 
 export class SSHConnectionManager {
   private conn: Client | null = null;
+  // true only between ssh2 'ready' and disconnect; the socket exists during the handshake too
+  private isReady = false;
   private sshConfig: SSHConfig;
+  // stays true until post-connect setup (su elevation, persistent shell) settles
   private isConnecting = false;
   private connectionPromise: Promise<void> | null = null;
   private suShell: ClientChannel | null = null;
@@ -713,21 +716,24 @@ export class SSHConnectionManager {
   }
 
   async connect(): Promise<void> {
-    if (this.conn && this.isConnected()) {
-      return; // Already connected
+    // checked first so concurrent callers also wait for post-connect setup
+    if (this.isConnecting && this.connectionPromise) {
+      return this.connectionPromise;
     }
 
-    if (this.isConnecting && this.connectionPromise) {
-      return this.connectionPromise; // Wait for ongoing connection
+    if (this.isConnected()) {
+      return;
     }
 
     this.isConnecting = true;
+    this.isReady = false;
     this.connectionPromise = new Promise((resolve, reject) => {
       this.conn = new Client();
 
       const timeoutId = setTimeout(() => {
         this.conn?.end();
         this.conn = null;
+        this.isReady = false;
         this.isConnecting = false;
         this.connectionPromise = null;
         reject(new McpError(ErrorCode.InternalError, 'SSH connection timeout'));
@@ -735,7 +741,7 @@ export class SSHConnectionManager {
 
       this.conn.on('ready', () => {
         clearTimeout(timeoutId);
-        this.isConnecting = false;
+        this.isReady = true;
 
         const onReady = async () => {
           if (this.sshConfig.suPassword && !process.env.SSH_MCP_TEST) {
@@ -752,10 +758,14 @@ export class SSHConnectionManager {
         };
 
         onReady()
-          .then(() => resolve())
+          .then(() => {
+            this.isConnecting = false;
+            resolve();
+          })
           .catch((err: any) => {
             this.conn?.end();
             this.conn = null;
+            this.isReady = false;
             this.isConnecting = false;
             this.connectionPromise = null;
             reject(new McpError(ErrorCode.InternalError, `SSH post-connect setup failed: ${err?.message || err}`));
@@ -765,6 +775,7 @@ export class SSHConnectionManager {
       this.conn.on('error', (err: Error) => {
         clearTimeout(timeoutId);
         this.conn = null;
+        this.isReady = false;
         this.isConnecting = false;
         this.connectionPromise = null;
         reject(new McpError(ErrorCode.InternalError, `SSH connection error: ${err.message}`));
@@ -774,6 +785,7 @@ export class SSHConnectionManager {
         console.error('SSH connection ended');
         this.resetShellState();
         this.conn = null;
+        this.isReady = false;
         this.isConnecting = false;
         this.connectionPromise = null;
       });
@@ -782,6 +794,7 @@ export class SSHConnectionManager {
         console.error('SSH connection closed');
         this.resetShellState();
         this.conn = null;
+        this.isReady = false;
         this.isConnecting = false;
         this.connectionPromise = null;
       });
@@ -793,7 +806,7 @@ export class SSHConnectionManager {
   }
 
   isConnected(): boolean {
-    return this.conn !== null && (this.conn as any)._sock && !(this.conn as any)._sock.destroyed;
+    return this.conn !== null && this.isReady && (this.conn as any)._sock && !(this.conn as any)._sock.destroyed;
   }
 
   getSudoPassword(): string | undefined {
@@ -908,9 +921,8 @@ export class SSHConnectionManager {
   }
 
   async ensureConnected(): Promise<void> {
-    if (!this.isConnected()) {
-      await this.connect();
-    }
+    // connect() is a no-op when ready and joins any in-flight connect or post-connect setup
+    await this.connect();
 
     if (this.sshConfig.executionMode === 'persistent-shell' && !this.isElevated) {
       await this.ensurePersistentShell();
@@ -958,6 +970,7 @@ export class SSHConnectionManager {
     if (!this.conn) return;
     this.conn.end();
     this.conn = null;
+    this.isReady = false;
   }
 }
 

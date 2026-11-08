@@ -308,6 +308,37 @@ describe('SSHConnectionManager', () => {
         persistentManager.close();
       }
     }, 30000);
+
+    // regression: the CLI preconnects in persistent-shell mode, so a tool call can land mid-handshake
+    it('should not report connected or open channels before the handshake finishes', async () => {
+      const persistentManager = new SSHConnectionManager({
+        host,
+        port,
+        username,
+        password,
+        executionMode: 'persistent-shell',
+      });
+
+      try {
+        const preconnect = persistentManager.ensureConnected();
+        expect(persistentManager.isConnected()).toBe(false);
+        const result = await execSshCommandWithConnection(persistentManager, 'echo during-handshake');
+        await preconnect;
+
+        expect((result.content[0] as any).text.trim()).toBe('during-handshake');
+      } finally {
+        persistentManager.close();
+      }
+    }, 30000);
+
+    it('should run concurrent first commands in exec mode without waiting on a prior connect', async () => {
+      const results = await Promise.all([
+        execSshCommandWithConnection(manager, 'echo one'),
+        execSshCommandWithConnection(manager, 'echo two'),
+      ]);
+
+      expect(results.map((r) => (r.content[0] as any).text.trim())).toEqual(['one', 'two']);
+    }, 30000);
   });
 
   describe('Connection Lifecycle', () => {
