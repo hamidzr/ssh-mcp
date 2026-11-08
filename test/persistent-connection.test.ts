@@ -331,6 +331,27 @@ describe('SSHConnectionManager', () => {
       }
     }, 30000);
 
+    // regression: a command reading stdin used to swallow the marker line and hang until timeout
+    it('should not let persistent-shell commands read the command stream', async () => {
+      const persistentManager = new SSHConnectionManager({
+        host, port, username, password, executionMode: 'persistent-shell',
+      });
+      try {
+        await persistentManager.connect();
+        const readsStdin = await persistentManager.executeCommand('cat; read x; echo "[${x:-}]"', undefined, 5000);
+        expect(readsStdin).toEqual({ stdout: '[]\n', stderr: '', code: 0 });
+
+        const withStdin = await persistentManager.executeCommand('cat', 'line1\nline2\n', 5000);
+        expect(withStdin.stdout).toBe('line1\nline2\n');
+
+        await persistentManager.executeCommand('cd /tmp', undefined, 5000);
+        const pwd = await persistentManager.executeCommand('pwd', undefined, 5000);
+        expect(pwd.stdout).toBe('/tmp\n');
+      } finally {
+        persistentManager.close();
+      }
+    }, 30000);
+
     // regression: the old connection's late 'close' event used to null out the new connection
     it('should survive close() immediately followed by reconnect', async () => {
       await manager.connect();

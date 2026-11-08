@@ -327,11 +327,23 @@ export function wrapWithShell(command: string, shellPath: string | null): string
   return shellPath ? `${shellPath} -c ${shellQuote(command)}` : command;
 }
 
-// the marker reaches the output only through printf %s, so a terminal echo of the payload
-// (su runs in a pty) never contains `<marker>:` or `<marker>_START` and cannot be mistaken for them
-export function buildMarkedShellPayload(command: string, marker: string, withStart = false): string {
-  const start = withStart ? `printf '%s_START\\n' '${marker}'\n` : '';
-  return `${start}${command}\nprintf '%s:%s\\n' '${marker}' "$?"\n`;
+// payload for a shell that reads commands from its stdin (persistent shell, su shell).
+// the marker reaches the output only through printf %s, so an echo of the payload never contains
+// `<marker>:` or `<marker>_START`. the brace group keeps cd/export state but gets its own stdin,
+// otherwise a command that reads stdin would swallow the following lines, marker included.
+// stdin is passed as a quoted here-doc, which always ends with a newline.
+export function buildMarkedShellPayload(command: string, marker: string, stdin?: string): string {
+  const input = stdin === undefined || stdin.length === 0
+    ? '</dev/null'
+    : `<<'${marker}_IN'\n${stdin.endsWith('\n') ? stdin : `${stdin}\n`}${marker}_IN`;
+  return [
+    `printf '%s_START\\n' '${marker}'`,
+    '{',
+    command,
+    `} ${input}`,
+    `printf '%s:%s\\n' '${marker}' "$?"`,
+    '',
+  ].join('\n');
 }
 
 export type ShellMarkerParse =
@@ -494,7 +506,7 @@ export class SSHConnectionManager {
     return this.persistentShellPromise;
   }
 
-  private async executeWithPersistentShell(command: string, timeoutMs: number): Promise<CommandExecutionResult> {
+  private async executeWithPersistentShell(command: string, stdin: string | undefined, timeoutMs: number): Promise<CommandExecutionResult> {
     return this.enqueueShellCommand(async () => {
       const shell = await this.ensurePersistentShell();
       return new Promise((resolve, reject) => {
@@ -561,7 +573,7 @@ export class SSHConnectionManager {
         shell.on('error', onError);
         try { (shell as any).stderr?.on('data', onStderr); } catch (_e) { /* ignore */ }
 
-        const payload = buildMarkedShellPayload(command, marker);
+        const payload = buildMarkedShellPayload(command, marker, stdin);
         try {
           shell.write(payload);
         } catch (err: any) {
@@ -571,7 +583,7 @@ export class SSHConnectionManager {
     });
   }
 
-  private async executeWithSuShell(command: string, timeoutMs: number): Promise<CommandExecutionResult> {
+  private async executeWithSuShell(command: string, stdin: string | undefined, timeoutMs: number): Promise<CommandExecutionResult> {
     return this.enqueueShellCommand(async () => {
       if (!this.isChannelAlive(this.suShell)) {
         throw new McpError(ErrorCode.InternalError, 'su shell is not available');
@@ -638,8 +650,7 @@ export class SSHConnectionManager {
         shell.on('close', onClose);
         shell.on('error', onError);
 
-        // the start marker skips prompt and echo noise left over from elevation
-        const payload = buildMarkedShellPayload(command, marker, true);
+        const payload = buildMarkedShellPayload(command, marker, stdin);
         try {
           shell.write(payload);
         } catch (err: any) {
@@ -956,11 +967,11 @@ export class SSHConnectionManager {
     await this.ensureConnected();
 
     if (this.isElevated && this.isChannelAlive(this.suShell)) {
-      return this.executeWithSuShell(command, timeoutMs);
+      return this.executeWithSuShell(command, stdin, timeoutMs);
     }
 
     if (this.sshConfig.executionMode === 'persistent-shell') {
-      return this.executeWithPersistentShell(command, timeoutMs);
+      return this.executeWithPersistentShell(command, stdin, timeoutMs);
     }
 
     const shellPath = await this.getCommandShell();

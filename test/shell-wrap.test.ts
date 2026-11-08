@@ -43,7 +43,7 @@ describe('extractShellMarker', () => {
 
   it('ignores a terminal echo of the payload and reads the real exit code', () => {
     // shape of a real su pty transcript: prompt, echoed payload lines, output, marker
-    const payload = buildMarkedShellPayload('whoami', marker, true);
+    const payload = buildMarkedShellPayload('whoami', marker);
     const echoed = payload.split('\n').filter(Boolean).map((line) => `host:~# ${line}\r\n`).join('');
     const buffer = `${echoed}${marker}_START\r\nroot\r\n${marker}:0\r\nhost:~# `;
     expect(extractShellMarker(buffer, marker)).toEqual({
@@ -52,7 +52,7 @@ describe('extractShellMarker', () => {
   });
 
   it('waits while only the echoed payload has arrived', () => {
-    const echoed = buildMarkedShellPayload('whoami', marker, true).replace(/\n/g, '\r\n');
+    const echoed = buildMarkedShellPayload('whoami', marker).replace(/\n/g, '\r\n');
     expect(extractShellMarker(echoed, marker)).toEqual({ done: false });
   });
 
@@ -60,5 +60,19 @@ describe('extractShellMarker', () => {
     expect(extractShellMarker(`a b${marker}:2\n`, marker)).toEqual({
       done: true, output: 'a b', code: 2, remainder: '',
     });
+  });
+});
+
+describe('buildMarkedShellPayload', () => {
+  const marker = '__SSH_MCP_DONE_1_abc__';
+
+  it('runs the command in a brace group with stdin from /dev/null', () => {
+    expect(buildMarkedShellPayload('echo hi', marker)).toBe(
+      `printf '%s_START\\n' '${marker}'\n{\necho hi\n} </dev/null\nprintf '%s:%s\\n' '${marker}' "$?"\n`,
+    );
+  });
+
+  it('feeds stdin through a quoted here-doc', () => {
+    expect(buildMarkedShellPayload('cat', marker, 'a $HOME')).toContain(`} <<'${marker}_IN'\na $HOME\n${marker}_IN\n`);
   });
 });
