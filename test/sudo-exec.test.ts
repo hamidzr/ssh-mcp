@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { spawn } from 'child_process';
 import { join } from 'path';
+import { SSHConnectionManager, execSshCommandWithConnection } from '../src/index';
 
 // Very small, focused tests for the sudo-exec MCP tool. This file is intentionally
 // small and straightforward (no heavy debug plumbing) — the integration surface
@@ -109,9 +110,34 @@ describe('sudo-exec tool authentication', () => {
   it('executes su when provided --suPassword', async () => {
     const res = await runSuMcpCommand('whoami', 'secret');
     expect(res.error).toBeUndefined();
-    const out = (res.result?.content?.[0]?.text || '').toLowerCase();
-    expect(out).toContain('root');
+    // exact match: no pty echo or prompt noise in the output
+    expect(res.result?.content?.[0]?.text).toBe('root\n');
   }, 60000);
+
+  // regression: the su pty echoed the marker printf, which used to stall marker parsing until timeout
+  it('runs several commands in one su shell with clean output and exit codes', async () => {
+    const manager = new SSHConnectionManager({
+      host: '127.0.0.1', port: 2222, username: 'test', password: 'secret', suPassword: 'secret',
+    });
+    try {
+      await manager.connect();
+      await manager.ensureElevated();
+
+      const whoami = await manager.executeCommand('whoami', undefined, 5000);
+      expect(whoami).toEqual({ stdout: 'root\n', stderr: '', code: 0 });
+
+      const noNewline = await manager.executeCommand("printf 'a b'", undefined, 5000);
+      expect(noNewline).toEqual({ stdout: 'a b', stderr: '', code: 0 });
+
+      const multiLine = await execSshCommandWithConnection(manager, 'echo one\necho two', undefined, 5000);
+      expect((multiLine.content[0] as any).text).toBe('one\ntwo\n');
+
+      const failed = await manager.executeCommand('false', undefined, 5000);
+      expect(failed.code).toBe(1);
+    } finally {
+      manager.close();
+    }
+  }, 30000);
 
   it('fails when sudo requires password but none provided', async () => {
     const res = await runMcpCommand('whoami');

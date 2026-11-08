@@ -327,6 +327,32 @@ export function wrapWithShell(command: string, shellPath: string | null): string
   return shellPath ? `${shellPath} -c ${shellQuote(command)}` : command;
 }
 
+// the marker reaches the output only through printf %s, so a terminal echo of the payload
+// (su runs in a pty) never contains `<marker>:` or `<marker>_START` and cannot be mistaken for them
+export function buildMarkedShellPayload(command: string, marker: string, withStart = false): string {
+  const start = withStart ? `printf '%s_START\\n' '${marker}'\n` : '';
+  return `${start}${command}\nprintf '%s:%s\\n' '${marker}' "$?"\n`;
+}
+
+export type ShellMarkerParse =
+  | { done: false }
+  | { done: true; output: string; code: number; remainder: string };
+
+// output runs from the start marker (when present) up to `<marker>:<exit code>`
+export function extractShellMarker(buffer: string, marker: string): ShellMarkerParse {
+  const start = new RegExp(`${marker}_START\\r?\\n`).exec(buffer);
+  const bodyStart = start ? start.index + start[0].length : 0;
+  const end = new RegExp(`${marker}:(\\d+)\\r?\\n`).exec(buffer.slice(bodyStart));
+  if (!end) return { done: false };
+
+  return {
+    done: true,
+    output: buffer.slice(bodyStart, bodyStart + end.index),
+    code: Number.parseInt(end[1], 10),
+    remainder: buffer.slice(bodyStart + end.index + end[0].length),
+  };
+}
+
 // Escape command for use in shell contexts (like pkill)
 export function escapeCommandForShell(command: string): string {
   // Replace single quotes with escaped single quotes
@@ -424,30 +450,6 @@ export class SSHConnectionManager {
     return `__SSH_MCP_DONE_${Date.now()}_${Math.random().toString(16).slice(2)}__`;
   }
 
-  private extractShellMarker(
-    buffer: string,
-    marker: string
-  ): { done: false } | { done: true; output: string; code: number; remainder: string } {
-    const markerPrefix = `${marker}:`;
-    const markerIndex = buffer.indexOf(markerPrefix);
-    if (markerIndex === -1) return { done: false };
-
-    const afterMarker = buffer.slice(markerIndex + markerPrefix.length);
-    const newlineIndex = afterMarker.indexOf('\n');
-    if (newlineIndex === -1) return { done: false };
-
-    const codeRaw = afterMarker.slice(0, newlineIndex).trim();
-    const code = Number.parseInt(codeRaw, 10);
-    if (Number.isNaN(code)) return { done: false };
-
-    return {
-      done: true,
-      output: buffer.slice(0, markerIndex),
-      code,
-      remainder: afterMarker.slice(newlineIndex + 1),
-    };
-  }
-
   private enqueueShellCommand<T>(task: () => Promise<T>): Promise<T> {
     const queuedTask = this.shellQueue.then(task, task);
     this.shellQueue = queuedTask.then(() => undefined, () => undefined);
@@ -492,15 +494,6 @@ export class SSHConnectionManager {
     return this.persistentShellPromise;
   }
 
-  private trimInteractiveCommandEcho(output: string, command: string): string {
-    const normalized = output.replace(/\r/g, '');
-    const lines = normalized.split('\n');
-    if (lines.length > 0 && lines[0].includes(command)) {
-      lines.shift();
-    }
-    return lines.join('\n');
-  }
-
   private async executeWithPersistentShell(command: string, timeoutMs: number): Promise<CommandExecutionResult> {
     return this.enqueueShellCommand(async () => {
       const shell = await this.ensurePersistentShell();
@@ -535,7 +528,7 @@ export class SSHConnectionManager {
 
         const onStdout = (chunk: Buffer) => {
           stdoutBuffer += chunk.toString();
-          const parsed = this.extractShellMarker(stdoutBuffer, marker);
+          const parsed = extractShellMarker(stdoutBuffer, marker);
           if (!parsed.done) return;
 
           this.persistentStdoutCarry = parsed.remainder;
@@ -568,7 +561,7 @@ export class SSHConnectionManager {
         shell.on('error', onError);
         try { (shell as any).stderr?.on('data', onStderr); } catch (_e) { /* ignore */ }
 
-        const payload = `${command}\nprintf '${marker}:%s\\n' "$?"\n`;
+        const payload = buildMarkedShellPayload(command, marker);
         try {
           shell.write(payload);
         } catch (err: any) {
@@ -614,12 +607,13 @@ export class SSHConnectionManager {
 
         const onData = (chunk: Buffer) => {
           buffer += chunk.toString();
-          const parsed = this.extractShellMarker(buffer, marker);
+          const parsed = extractShellMarker(buffer, marker);
           if (!parsed.done) return;
 
           this.suStdoutCarry = parsed.remainder;
           finishWithResult({
-            stdout: this.trimInteractiveCommandEcho(parsed.output, command),
+            // pty output uses CRLF line endings
+            stdout: parsed.output.replace(/\r\n/g, '\n'),
             stderr: '',
             code: parsed.code,
           });
@@ -644,7 +638,8 @@ export class SSHConnectionManager {
         shell.on('close', onClose);
         shell.on('error', onError);
 
-        const payload = `${command}\nprintf '${marker}:%s\\n' "$?"\n`;
+        // the start marker skips prompt and echo noise left over from elevation
+        const payload = buildMarkedShellPayload(command, marker, true);
         try {
           shell.write(payload);
         } catch (err: any) {
@@ -883,6 +878,8 @@ export class SSHConnectionManager {
             if (/#/.test(buffer)) {
               clearTimeout(timeoutId);
               cleanup();
+              // the su shell is an interactive pty, silence echo and prompts so command output stays clean
+              stream.write("stty -echo 2>/dev/null; PS1=''; PS2=''\n");
               this.suShell = stream;
               this.isElevated = true;
               this.suPromise = null;

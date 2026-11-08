@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'child_process';
 import { existsSync } from 'fs';
-import { parseShellProbe, shellQuote, wrapWithShell } from '../src/index.js';
+import { buildMarkedShellPayload, extractShellMarker, parseShellProbe, shellQuote, wrapWithShell } from '../src/index.js';
 
 describe('parseShellProbe', () => {
   it('returns the probed path', () => {
@@ -35,5 +35,30 @@ describe('wrapWithShell', () => {
     expect(execFileSync('/bin/zsh', ['-c', wrapWithShell(command, '/bin/bash')]).toString()).toBe(
       "<-p><tcp><--dport><22> q'uote\n",
     );
+  });
+});
+
+describe('extractShellMarker', () => {
+  const marker = '__SSH_MCP_DONE_1_abc__';
+
+  it('ignores a terminal echo of the payload and reads the real exit code', () => {
+    // shape of a real su pty transcript: prompt, echoed payload lines, output, marker
+    const payload = buildMarkedShellPayload('whoami', marker, true);
+    const echoed = payload.split('\n').filter(Boolean).map((line) => `host:~# ${line}\r\n`).join('');
+    const buffer = `${echoed}${marker}_START\r\nroot\r\n${marker}:0\r\nhost:~# `;
+    expect(extractShellMarker(buffer, marker)).toEqual({
+      done: true, output: 'root\r\n', code: 0, remainder: 'host:~# ',
+    });
+  });
+
+  it('waits while only the echoed payload has arrived', () => {
+    const echoed = buildMarkedShellPayload('whoami', marker, true).replace(/\n/g, '\r\n');
+    expect(extractShellMarker(echoed, marker)).toEqual({ done: false });
+  });
+
+  it('handles output without a trailing newline and no start marker', () => {
+    expect(extractShellMarker(`a b${marker}:2\n`, marker)).toEqual({
+      done: true, output: 'a b', code: 2, remainder: '',
+    });
   });
 });
