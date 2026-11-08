@@ -509,9 +509,23 @@ export class SSHConnectionManager {
     this.suStdoutCarry = '';
   }
 
+  // sshd keeps a session (and its MaxSessions slot) until the remote process exits, so closing
+  // the channel alone leaks it: signal the process, then send CHANNEL_CLOSE.
+  // ssh2's channel.signal() is a no-op after we sent EOF, which exec channels always do, so the
+  // request goes through the protocol object; servers without signal support ignore it
+  private abortChannel(channel: ClientChannel): void {
+    const internal = channel as any;
+    try {
+      if (internal.outgoing?.state === 'open' || internal.outgoing?.state === 'eof') {
+        internal._client?._protocol?.signal?.(internal.outgoing.id, 'KILL');
+      }
+    } catch (_e) { /* ignore */ }
+    try { channel.close(); } catch (_e) { /* ignore */ }
+  }
+
   private closeSuShell(): void {
     if (this.suShell) {
-      try { this.suShell.end(); } catch (_e) { /* ignore */ }
+      this.abortChannel(this.suShell);
       this.suShell = null;
     }
     this.isElevated = false;
@@ -521,7 +535,7 @@ export class SSHConnectionManager {
 
   private closePersistentShell(): void {
     if (this.persistentShell) {
-      try { this.persistentShell.end(); } catch (_e) { /* ignore */ }
+      this.abortChannel(this.persistentShell);
       this.persistentShell = null;
     }
     this.persistentShellPromise = null;
@@ -733,14 +747,22 @@ export class SSHConnectionManager {
     return new Promise((resolve, reject) => {
       const conn = this.getConnection();
       let settled = false;
+      let channel: ClientChannel | null = null;
 
       const timeoutId = setTimeout(() => {
         if (settled) return;
         settled = true;
+        // free the session slot (sshd caps them per connection) and stop the remote process
+        if (channel) this.abortChannel(channel);
         reject(new McpError(ErrorCode.InternalError, `Command execution timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
       conn.exec(command, (err: Error | undefined, stream: ClientChannel) => {
+        if (!err && settled) {
+          // opened after the timeout fired
+          this.abortChannel(stream);
+          return;
+        }
         if (err) {
           if (settled) return;
           settled = true;
@@ -749,6 +771,7 @@ export class SSHConnectionManager {
           return;
         }
 
+        channel = stream;
         let stdout = '';
         let stderr = '';
 

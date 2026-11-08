@@ -331,6 +331,20 @@ describe('SSHConnectionManager', () => {
       }
     }, 30000);
 
+    // regression: timed-out exec channels stayed open; sshd caps sessions per connection (MaxSessions 10)
+    it('should release exec channels of timed-out commands', async () => {
+      await manager.connect();
+      for (let i = 0; i < 12; i++) {
+        await expect(manager.executeCommand('sleep 30', undefined, 300)).rejects.toThrow(/timed out/);
+      }
+      const result = await manager.executeCommand('echo still-usable', undefined, 5000);
+      expect(result.stdout).toBe('still-usable\n');
+
+      // the remote process is stopped too
+      const ps = await manager.executeCommand('ps -eo args | grep -c "^sleep 30$" || true', undefined, 5000);
+      expect(ps.stdout.trim()).toBe('0');
+    }, 60000);
+
     // regression: a command reading stdin used to swallow the marker line and hang until timeout
     it('should not let persistent-shell commands read the command stream', async () => {
       const persistentManager = new SSHConnectionManager({
