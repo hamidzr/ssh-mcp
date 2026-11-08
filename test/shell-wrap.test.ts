@@ -66,14 +66,14 @@ describe('extractShellMarker', () => {
 describe('buildMarkedShellPayload', () => {
   const marker = '__SSH_MCP_DONE_1_abc__';
 
-  it('runs the command in a brace group with stdin from /dev/null', () => {
-    expect(buildMarkedShellPayload('echo hi', marker)).toBe(
-      `printf '%s_START\\n' '${marker}'\n{\necho hi\n} </dev/null\nprintf '%s:%s\\n' '${marker}' "$?"\n`,
+  it('evals the quoted command with stdin from /dev/null', () => {
+    expect(buildMarkedShellPayload("echo 'hi'", marker)).toBe(
+      `printf '%s_START\\n' '${marker}'\ncommand eval 'echo '\\''hi'\\''' </dev/null\nprintf '%s:%s\\n' '${marker}' "$?"\n`,
     );
   });
 
-  it('feeds stdin through a quoted here-doc', () => {
-    expect(buildMarkedShellPayload('cat', marker, 'a $HOME')).toContain(`} <<'${marker}_IN'\na $HOME\n${marker}_IN\n`);
+  it('pipes given stdin from the printf builtin', () => {
+    expect(buildMarkedShellPayload('cat', marker, 'a $HOME')).toContain(`printf '%s' 'a $HOME' | command eval 'cat'\n`);
   });
 });
 

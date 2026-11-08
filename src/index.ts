@@ -329,19 +329,22 @@ export function wrapWithShell(command: string, shellPath: string | null): string
 }
 
 // payload for a shell that reads commands from its stdin (persistent shell, su shell).
-// the marker reaches the output only through printf %s, so an echo of the payload never contains
-// `<marker>:` or `<marker>_START`. the brace group keeps cd/export state but gets its own stdin,
-// otherwise a command that reads stdin would swallow the following lines, marker included.
-// stdin is passed as a quoted here-doc, which always ends with a newline.
+// - the command is one single-quoted `eval` argument, so a syntax error, unbalanced quote, or
+//   trailing backslash stays inside it instead of breaking the framing; `command` keeps a POSIX
+//   shell from exiting on an eval syntax error. eval runs in the current shell, so cd/export persist
+// - the marker reaches the output only through printf %s, so an echo of the payload never contains
+//   `<marker>:` or `<marker>_START`
+// - the command gets its own stdin, otherwise reading stdin would swallow the following lines.
+//   given stdin is piped from the printf builtin (not a here-doc, which older bash writes to a temp
+//   file); that pipeline runs in a subshell, so such a command does not persist state
 export function buildMarkedShellPayload(command: string, marker: string, stdin?: string): string {
-  const input = stdin === undefined || stdin.length === 0
-    ? '</dev/null'
-    : `<<'${marker}_IN'\n${stdin.endsWith('\n') ? stdin : `${stdin}\n`}${marker}_IN`;
+  const run = `command eval ${shellQuote(command)}`;
+  const line = stdin === undefined || stdin.length === 0
+    ? `${run} </dev/null`
+    : `printf '%s' ${shellQuote(stdin)} | ${run}`;
   return [
     `printf '%s_START\\n' '${marker}'`,
-    '{',
-    command,
-    `} ${input}`,
+    line,
     `printf '%s:%s\\n' '${marker}' "$?"`,
     '',
   ].join('\n');
@@ -476,6 +479,8 @@ export class SSHConnectionManager {
   private connectionPromise: Promise<void> | null = null;
   private suShell: ClientChannel | null = null;
   private suPromise: Promise<void> | null = null;
+  // bumped whenever the su shell is dropped, so an elevation started before that cannot install itself
+  private suGeneration = 0;
   private isElevated = false;
   private persistentShell: ClientChannel | null = null;
   private persistentShellPromise: Promise<ClientChannel> | null = null;
@@ -507,6 +512,7 @@ export class SSHConnectionManager {
   }
 
   private resetShellState(): void {
+    this.suGeneration++;
     this.suShell = null;
     this.suPromise = null;
     this.isElevated = false;
@@ -531,6 +537,7 @@ export class SSHConnectionManager {
   }
 
   private closeSuShell(): void {
+    this.suGeneration++;
     if (this.suShell) {
       this.abortChannel(this.suShell);
       this.suShell = null;
@@ -806,10 +813,23 @@ export class SSHConnectionManager {
           reject(new McpError(ErrorCode.InternalError, `SSH exec stream error: ${streamErr.message}`));
         });
 
-        stream.on('close', (code: number | undefined) => {
+        stream.on('close', (code?: number | null, signal?: string) => {
           if (settled) return;
           settled = true;
           clearTimeout(timeoutId);
+          // no exit status: killed by a signal, or the channel was torn down with the connection.
+          // only a server that never sends exit-status on a live connection gets code null
+          if (typeof code !== 'number') {
+            const output = stderr || stdout;
+            if (signal) {
+              reject(new McpError(ErrorCode.InternalError, `Command terminated by signal ${signal}:\n${output}`));
+              return;
+            }
+            if (!this.isConnected()) {
+              reject(new McpError(ErrorCode.InternalError, `SSH connection lost before the command finished:\n${output}`));
+              return;
+            }
+          }
           resolve({
             stdout,
             stderr,
@@ -948,10 +968,8 @@ export class SSHConnectionManager {
         console.error('setSuPassword: failed to elevate to su shell:', err);
       }
     } else {
-      // If clearing suPassword, drop any existing suShell
-      if (this.suShell) {
-        this.closeSuShell();
-      }
+      // drop the su shell and cancel any elevation still in flight
+      this.closeSuShell();
     }
   }
 
@@ -962,6 +980,7 @@ export class SSHConnectionManager {
 
     if (this.suPromise) return this.suPromise;
 
+    const generation = this.suGeneration;
     const elevation = this.getCommandShell().then((shellPath) => new Promise<void>((resolve, reject) => {
       const conn = this.getConnection();
       const session = new SuSession(this.makeShellMarker(), password, shellPath ?? '/bin/sh');
@@ -973,8 +992,11 @@ export class SSHConnectionManager {
         settled = true;
         clearTimeout(timeoutId);
         stream?.removeListener('data', onData);
+        if (!error && generation !== this.suGeneration) {
+          error = 'su elevation cancelled';
+        }
         if (error || !stream) {
-          try { stream?.close(); } catch (_e) { /* ignore */ }
+          if (stream) this.abortChannel(stream);
           reject(new McpError(ErrorCode.InternalError, error ?? 'su shell unavailable'));
           return;
         }

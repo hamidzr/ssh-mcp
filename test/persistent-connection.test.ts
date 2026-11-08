@@ -345,6 +345,38 @@ describe('SSHConnectionManager', () => {
       expect(ps.stdout.trim()).toBe('0');
     }, 60000);
 
+    // regression: a syntax error, unbalanced quote, or trailing backslash used to break the payload
+    // framing and kill or hang the shell, losing its state
+    it('should keep the persistent shell alive across malformed commands', async () => {
+      const persistentManager = new SSHConnectionManager({
+        host, port, username, password, executionMode: 'persistent-shell',
+      });
+      try {
+        await persistentManager.connect();
+        await persistentManager.executeCommand('cd /tmp', undefined, 5000);
+        expect((await persistentManager.executeCommand('if then', undefined, 5000)).code).toBe(2);
+        expect((await persistentManager.executeCommand('echo "unbalanced', undefined, 5000)).code).toBe(2);
+        // a trailing backslash stays inside the command instead of joining the marker line
+        expect((await persistentManager.executeCommand('echo a \\', undefined, 5000)).stdout).toBe('a \\\n');
+        const heredoc = await persistentManager.executeCommand("cat <<'EOF'\nhd\nEOF", undefined, 5000);
+        expect(heredoc.stdout).toBe('hd\n');
+        const pwd = await persistentManager.executeCommand('pwd', undefined, 5000);
+        expect(pwd.stdout).toBe('/tmp\n');
+      } finally {
+        persistentManager.close();
+      }
+    }, 30000);
+
+    // regression: a dropped connection or a signal-killed command used to report success
+    it('should fail commands killed by a signal or cut off by a lost connection', async () => {
+      await manager.connect();
+      await expect(manager.executeCommand('echo partial; kill -9 $$', undefined, 5000)).rejects.toThrow(/signal/i);
+
+      const pending = manager.executeCommand('sleep 5', undefined, 10000);
+      setTimeout(() => manager.close(), 300);
+      await expect(pending).rejects.toThrow(/connection/i);
+    }, 30000);
+
     // regression: a command reading stdin used to swallow the marker line and hang until timeout
     it('should not let persistent-shell commands read the command stream', async () => {
       const persistentManager = new SSHConnectionManager({

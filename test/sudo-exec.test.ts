@@ -164,6 +164,40 @@ describe('sudo-exec tool authentication', () => {
     }
   }, 30000);
 
+  // regression: an elevation still in flight when su was cleared used to install a root shell anyway
+  it('does not elevate after the su password is cleared mid-elevation', async () => {
+    const manager = new SSHConnectionManager({
+      host: '127.0.0.1', port: 2222, username: 'test', password: 'secret', suPassword: 'secret',
+    });
+    try {
+      await manager.connect();
+      const elevation = manager.ensureElevated();
+      await manager.setSuPassword(undefined);
+      await expect(elevation).rejects.toThrow(/cancelled|closed/);
+
+      const whoami = await manager.executeCommand('whoami', undefined, 5000);
+      expect(whoami.stdout).toBe('test\n');
+    } finally {
+      manager.close();
+    }
+  }, 30000);
+
+  it('keeps the su shell alive across a syntax error', async () => {
+    const manager = new SSHConnectionManager({
+      host: '127.0.0.1', port: 2222, username: 'test', password: 'secret', suPassword: 'secret',
+    });
+    try {
+      await manager.connect();
+      await manager.ensureElevated();
+      await manager.executeCommand('cd /tmp', undefined, 5000);
+      expect((await manager.executeCommand('if then', undefined, 5000)).code).toBe(2);
+      const after = await manager.executeCommand('whoami; pwd', undefined, 5000);
+      expect(after.stdout).toBe('root\n/tmp\n');
+    } finally {
+      manager.close();
+    }
+  }, 30000);
+
   it('rejects a wrong su password without leaking it', async () => {
     const manager = new SSHConnectionManager({
       host: '127.0.0.1', port: 2222, username: 'test', password: 'secret', suPassword: 'wrong-pass-123',
