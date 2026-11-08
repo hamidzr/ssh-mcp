@@ -331,6 +331,28 @@ describe('SSHConnectionManager', () => {
       }
     }, 30000);
 
+    // regression: the old connection's late 'close' event used to null out the new connection
+    it('should survive close() immediately followed by reconnect', async () => {
+      await manager.connect();
+      manager.close();
+      await manager.ensureConnected();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      expect(manager.isConnected()).toBe(true);
+      const result = await execSshCommandWithConnection(manager, 'echo reconnected');
+      expect((result.content[0] as any).text.trim()).toBe('reconnected');
+    }, 30000);
+
+    it('should reject a pending connect when close() is called mid-handshake', async () => {
+      const pending = manager.connect();
+      manager.close();
+      await expect(pending).rejects.toThrow(/closed/i);
+      expect(manager.isConnected()).toBe(false);
+
+      await manager.connect();
+      expect(manager.isConnected()).toBe(true);
+    }, 30000);
+
     it('should run concurrent first commands in exec mode without waiting on a prior connect', async () => {
       const results = await Promise.all([
         execSshCommandWithConnection(manager, 'echo one'),

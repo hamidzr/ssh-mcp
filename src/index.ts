@@ -720,84 +720,97 @@ export class SSHConnectionManager {
       return;
     }
 
-    this.isConnecting = true;
+    const conn = new Client();
+    this.conn = conn;
     this.isReady = false;
+    this.isConnecting = true;
     this.connectionPromise = new Promise((resolve, reject) => {
-      this.conn = new Client();
+      let settled = false;
+      // close() or a newer connect() replaces this.conn; late events from this client must not touch it
+      const isCurrent = () => this.conn === conn;
 
-      const timeoutId = setTimeout(() => {
-        this.conn?.end();
+      const teardown = () => {
+        if (!isCurrent()) return;
+        this.resetShellState();
         this.conn = null;
         this.isReady = false;
         this.isConnecting = false;
         this.connectionPromise = null;
-        reject(new McpError(ErrorCode.InternalError, 'SSH connection timeout'));
-      }, 30000); // 30 seconds connection timeout
+      };
 
-      this.conn.on('ready', () => {
+      const fail = (message: string) => {
         clearTimeout(timeoutId);
+        if (settled) return;
+        settled = true;
+        reject(new McpError(ErrorCode.InternalError, message));
+      };
+
+      const timeoutId = setTimeout(() => {
+        teardown();
+        conn.end();
+        fail('SSH connection timeout');
+      }, 30000);
+
+      conn.on('ready', () => {
+        clearTimeout(timeoutId);
+        if (!isCurrent()) {
+          conn.end();
+          fail('SSH connection closed before it was ready');
+          return;
+        }
         this.isReady = true;
 
-        const onReady = async () => {
-          if (this.sshConfig.suPassword && !process.env.SSH_MCP_TEST) {
-            try {
-              await this.ensureElevated();
-            } catch (_err) {
-              // continue without su shell, command execution will fallback
-            }
-          }
-
-          if (this.sshConfig.executionMode === 'persistent-shell' && !this.isElevated) {
-            await this.ensurePersistentShell();
-          }
-        };
-
-        onReady()
+        this.runPostConnectSetup()
           .then(() => {
+            if (!isCurrent()) throw new Error('connection closed during setup');
             this.isConnecting = false;
+            settled = true;
             resolve();
           })
           .catch((err: any) => {
-            this.conn?.end();
-            this.conn = null;
-            this.isReady = false;
-            this.isConnecting = false;
-            this.connectionPromise = null;
-            reject(new McpError(ErrorCode.InternalError, `SSH post-connect setup failed: ${err?.message || err}`));
+            teardown();
+            conn.end();
+            fail(`SSH post-connect setup failed: ${err?.message || err}`);
           });
       });
 
-      this.conn.on('error', (err: Error) => {
-        clearTimeout(timeoutId);
-        this.conn = null;
-        this.isReady = false;
-        this.isConnecting = false;
-        this.connectionPromise = null;
-        reject(new McpError(ErrorCode.InternalError, `SSH connection error: ${err.message}`));
+      conn.on('error', (err: Error) => {
+        // ending a detached client mid-handshake surfaces as an error; report it as the close it is
+        const message = isCurrent() ? `SSH connection error: ${err.message}` : 'SSH connection closed';
+        teardown();
+        fail(message);
       });
 
-      this.conn.on('end', () => {
-        console.error('SSH connection ended');
-        this.resetShellState();
-        this.conn = null;
-        this.isReady = false;
-        this.isConnecting = false;
-        this.connectionPromise = null;
+      conn.on('end', () => {
+        if (isCurrent()) console.error('SSH connection ended');
+        teardown();
+        fail('SSH connection closed');
       });
 
-      this.conn.on('close', () => {
-        console.error('SSH connection closed');
-        this.resetShellState();
-        this.conn = null;
-        this.isReady = false;
-        this.isConnecting = false;
-        this.connectionPromise = null;
+      conn.on('close', () => {
+        if (isCurrent()) console.error('SSH connection closed');
+        teardown();
+        fail('SSH connection closed');
       });
 
-      this.conn.connect(this.getConnectConfig());
+      conn.connect(this.getConnectConfig());
     });
 
     return this.connectionPromise;
+  }
+
+  private async runPostConnectSetup(): Promise<void> {
+    if (this.sshConfig.suPassword && !process.env.SSH_MCP_TEST) {
+      try {
+        await this.ensureElevated();
+      } catch (_err) {
+        // continue without su shell, command execution will fallback
+      }
+    }
+
+    if (this.sshConfig.executionMode === 'persistent-shell' && !this.isElevated) {
+      await this.ensurePersistentShell();
+    }
   }
 
   isConnected(): boolean {
@@ -962,12 +975,15 @@ export class SSHConnectionManager {
   }
 
   close(): void {
+    const conn = this.conn;
     this.closeSuShell();
     this.closePersistentShell();
-    if (!this.conn) return;
-    this.conn.end();
+    // detach first so this client's own end/close events are ignored and a pending connect() rejects
     this.conn = null;
     this.isReady = false;
+    this.isConnecting = false;
+    this.connectionPromise = null;
+    conn?.end();
   }
 }
 
