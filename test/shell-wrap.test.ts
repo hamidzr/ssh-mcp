@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'child_process';
 import { existsSync } from 'fs';
-import { buildMarkedShellPayload, extractShellMarker, parseShellProbe, shellQuote, wrapWithShell } from '../src/index.js';
+import { SuSession, buildMarkedShellPayload, extractShellMarker, parseShellProbe, shellQuote, wrapWithShell } from '../src/index.js';
 
 describe('parseShellProbe', () => {
   it('returns the probed path', () => {
@@ -74,5 +74,49 @@ describe('buildMarkedShellPayload', () => {
 
   it('feeds stdin through a quoted here-doc', () => {
     expect(buildMarkedShellPayload('cat', marker, 'a $HOME')).toContain(`} <<'${marker}_IN'\na $HOME\n${marker}_IN\n`);
+  });
+});
+
+describe('SuSession', () => {
+  const marker = '__SSH_MCP_DONE_1_abc__';
+  const newSession = () => new SuSession(marker, 'hunter2', '/bin/bash');
+
+  it('ignores a banner with a password prompt and a # before its own marker', () => {
+    const su = newSession();
+    expect(su.start()).toBe(`printf '%s_SU\\n' '${marker}'; exec su -\n`);
+    expect(su.push('# Welcome\r\nChange your Password: now\r\nhost:~# ')).toEqual({});
+    // terminal echo of the start line does not contain `<marker>_SU`
+    expect(su.push(`${su.start().trim()}\r\n`)).toEqual({});
+  });
+
+  it('sends the password once, then switches to a raw non-interactive shell, then checks uid 0', () => {
+    const su = newSession();
+    expect(su.push(`${marker}_SU\r\nPass`)).toEqual({});
+    expect(su.push('word: ')).toEqual({ send: 'hunter2\n' });
+    const setup = su.push('\r\nhost:~# \x1b[6n');
+    expect(setup.send).toMatch(/^stty raw -echo && exec \/bin\/bash -c '.*exec \/bin\/bash \/dev\/stdin'\n$/);
+    expect(setup.send).not.toContain(`${marker}_READY`);
+    expect(su.push(`${marker}_READY:0\n`)).toEqual({ done: true });
+  });
+
+  it('rejects a shell that is not root', () => {
+    const su = newSession();
+    su.push(`${marker}_SU\r\nhost:~$ `);
+    expect(su.push(`${marker}_READY:1000\n`)).toEqual({ fail: 'su did not produce a root shell (uid 1000)' });
+  });
+
+  it('reports su errors without echoing the password', () => {
+    const su = newSession();
+    su.push(`${marker}_SU\r\nPassword: `);
+    const step = su.push('\r\nsu: Authentication failure\r\n');
+    expect(step).toEqual({ fail: 'su failed: su: Authentication failure' });
+    expect(step.fail).not.toContain('hunter2');
+  });
+
+  it('treats su warnings as non-fatal', () => {
+    const su = newSession();
+    su.push(`${marker}_SU\r\nPassword: `);
+    expect(su.push('\r\nsu: warning: cannot change directory to /root\r\n')).toEqual({});
+    expect(su.push('root@host:/# ').send).toContain('stty raw -echo');
   });
 });

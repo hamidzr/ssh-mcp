@@ -49,6 +49,7 @@ const DISABLE_SUDO = argvConfig.disableSudo !== undefined;
 const KEY = argvConfig.key;
 const DEFAULT_TIMEOUT = argvConfig.timeout ? parseInt(argvConfig.timeout) : 60000; // 60 seconds default timeout
 const SHELL_PROBE_TIMEOUT = 10000;
+const SU_ELEVATION_TIMEOUT = 10000;
 // Max characters configuration:
 // - Default: 1000 characters
 // - When set via --maxChars:
@@ -365,6 +366,75 @@ export function extractShellMarker(buffer: string, marker: string): ShellMarkerP
   };
 }
 
+const ANSI_ESCAPE = /\x1b\[[0-9;?]*[A-Za-z]/g;
+
+export type SuStep = { send?: string; done?: true; fail?: string };
+
+// drives `su -` in an interactive pty. only output after our own start marker is trusted, so a
+// login banner mentioning "password" or containing '#' cannot trigger anything. once su gives a
+// prompt, the pty is switched to raw mode and the root shell is replaced by a non-interactive
+// shell reading the tty (no echo, prompts, or line-length limit), which reports its uid.
+// `exec su -` makes the channel close when root's shell exits instead of dropping back to the
+// login user's shell, where later commands would silently run unprivileged.
+export class SuSession {
+  private buffer = '';
+  private stage: 'await-su' | 'await-prompt' | 'await-ready' | 'finished' = 'await-su';
+  private passwordSent = false;
+
+  constructor(
+    private readonly marker: string,
+    private readonly password: string,
+    private readonly shellPath: string,
+  ) {}
+
+  start(): string {
+    return `printf '%s_SU\\n' '${this.marker}'; exec su -\n`;
+  }
+
+  push(text: string): SuStep {
+    if (this.stage === 'finished') return {};
+    this.buffer += text;
+
+    if (this.stage === 'await-su') {
+      const started = new RegExp(`${this.marker}_SU\\r?\\n`).exec(this.buffer);
+      if (!started) return {};
+      this.buffer = this.buffer.slice(started.index + started[0].length);
+      this.stage = 'await-prompt';
+    }
+
+    if (this.stage === 'await-prompt') {
+      const plain = this.buffer.replace(ANSI_ESCAPE, '');
+      const failure = /^[^\S\r\n]*(su: (?!warning)[^\r\n]*|sorry[^\r\n]*|[^\r\n]*(authentication failure|incorrect password)[^\r\n]*)/im.exec(plain);
+      if (failure) return this.finish({ fail: `su failed: ${failure[1].trim().slice(0, 200)}` });
+
+      if (!this.passwordSent && /password[^\r\n]*:\s*$/i.test(plain)) {
+        this.passwordSent = true;
+        this.buffer = '';
+        return { send: `${this.password}\n` };
+      }
+
+      if (/[#$%>]\s*$/.test(plain)) {
+        this.buffer = '';
+        this.stage = 'await-ready';
+        const ready = `printf '%s_READY:%s\\n' '${this.marker}' "$(id -u)"; exec ${this.shellPath} /dev/stdin`;
+        return { send: `stty raw -echo && exec ${this.shellPath} -c ${shellQuote(ready)}\n` };
+      }
+      return {};
+    }
+
+    const ready = new RegExp(`${this.marker}_READY:(\\d+)\\r?\\n`).exec(this.buffer);
+    if (!ready) return {};
+    if (ready[1] !== '0') return this.finish({ fail: `su did not produce a root shell (uid ${ready[1]})` });
+    return this.finish({ done: true });
+  }
+
+  private finish(step: SuStep): SuStep {
+    this.stage = 'finished';
+    this.buffer = '';
+    return step;
+  }
+}
+
 // Escape command for use in shell contexts (like pkill)
 export function escapeCommandForShell(command: string): string {
   // Replace single quotes with escaped single quotes
@@ -624,8 +694,7 @@ export class SSHConnectionManager {
 
           this.suStdoutCarry = parsed.remainder;
           finishWithResult({
-            // pty output uses CRLF line endings
-            stdout: parsed.output.replace(/\r\n/g, '\n'),
+            stdout: parsed.output,
             stderr: '',
             code: parsed.code,
           });
@@ -857,88 +926,66 @@ export class SSHConnectionManager {
   }
 
   async ensureElevated(): Promise<void> {
-    if (this.isElevated && this.suShell) return;
-    if (!this.sshConfig.suPassword) return;
+    if (this.isElevated && this.isChannelAlive(this.suShell)) return;
+    const password = this.sshConfig.suPassword;
+    if (!password) return;
 
     if (this.suPromise) return this.suPromise;
 
-    this.suPromise = new Promise((resolve, reject) => {
+    const elevation = this.getCommandShell().then((shellPath) => new Promise<void>((resolve, reject) => {
       const conn = this.getConnection();
+      const session = new SuSession(this.makeShellMarker(), password, shellPath ?? '/bin/sh');
+      let stream: ClientChannel | null = null;
+      let settled = false;
 
-      // Add a safety timeout so elevation doesn't hang forever
-      const timeoutId = setTimeout(() => {
-        this.suPromise = null;
-        reject(new McpError(ErrorCode.InternalError, 'su elevation timed out'));
-      }, 10000);  // 10 second timeout for elevation
-
-      conn.shell({ term: 'xterm', cols: 80, rows: 24 }, (err: Error | undefined, stream: ClientChannel) => {
-        if (err) {
-          clearTimeout(timeoutId);
-          this.suPromise = null;
-          reject(new McpError(ErrorCode.InternalError, `Failed to start interactive shell for su: ${err.message}`));
+      const finish = (error?: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        stream?.removeListener('data', onData);
+        if (error || !stream) {
+          try { stream?.close(); } catch (_e) { /* ignore */ }
+          reject(new McpError(ErrorCode.InternalError, error ?? 'su shell unavailable'));
           return;
         }
+        this.suShell = stream;
+        this.isElevated = true;
+        this.suStdoutCarry = '';
+        resolve();
+      };
 
-        let buffer = '';
-        let passwordSent = false;
-        const cleanup = () => {
-          try { stream.removeAllListeners('data'); } catch (e) { /* ignore */ }
-        };
+      const onData = (data: Buffer) => {
+        const step = session.push(data.toString());
+        if (step.fail) finish(step.fail);
+        else if (step.done) finish();
+        else if (step.send) stream?.write(step.send);
+      };
 
-        const onData = (data: Buffer) => {
-          const text = data.toString();
-          buffer += text;
+      const timeoutId = setTimeout(() => finish('su elevation timed out'), SU_ELEVATION_TIMEOUT);
 
-          // If we haven't sent the password yet, look for the password prompt
-          if (!passwordSent && /password[: ]/i.test(buffer)) {
-            passwordSent = true;
-            stream.write(this.sshConfig.suPassword + '\n');
-            // Don't return; keep looking for root prompt
-          }
-
-          // After password is sent, look for any root indicator
-          // Look for '#' which indicates root prompt (may be followed by spaces, escape codes, etc)
-          if (passwordSent) {
-            if (/#/.test(buffer)) {
-              clearTimeout(timeoutId);
-              cleanup();
-              // the su shell is an interactive pty, silence echo and prompts so command output stays clean
-              stream.write("stty -echo 2>/dev/null; PS1=''; PS2=''\n");
-              this.suShell = stream;
-              this.isElevated = true;
-              this.suPromise = null;
-              this.suStdoutCarry = '';
-              resolve();
-              return;
-            }
-          }
-
-          // Detect authentication failure messages
-          if (/authentication failure|incorrect password|su: .*failed|su: failure/i.test(buffer)) {
-            clearTimeout(timeoutId);
-            cleanup();
-            this.suPromise = null;
-            reject(new McpError(ErrorCode.InternalError, `su authentication failed: ${buffer}`));
-            return;
-          }
-        };
-
-        stream.on('data', onData);
-
-        stream.on('close', () => {
-          clearTimeout(timeoutId);
-          if (!this.isElevated) {
-            this.suPromise = null;
-            reject(new McpError(ErrorCode.InternalError, 'su shell closed before elevation completed'));
-          }
+      conn.shell({ term: 'xterm', cols: 200, rows: 24 }, (err: Error | undefined, channel: ClientChannel) => {
+        if (err) {
+          finish(`Failed to start interactive shell for su: ${err.message}`);
+          return;
+        }
+        if (settled) {
+          try { channel.close(); } catch (_e) { /* ignore */ }
+          return;
+        }
+        stream = channel;
+        channel.on('data', onData);
+        channel.on('close', () => {
+          if (this.suShell === channel) this.closeSuShell();
+          finish('su shell closed before elevation completed');
         });
-
-        // Kick off the su command
-        stream.write('su -\n');
+        channel.write(session.start());
       });
-    });
+    }));
 
-    return this.suPromise;
+    this.suPromise = elevation;
+    const clear = () => { if (this.suPromise === elevation) this.suPromise = null; };
+    elevation.then(clear, clear);
+    return elevation;
   }
 
   async ensureConnected(): Promise<void> {

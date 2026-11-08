@@ -134,6 +134,48 @@ describe('sudo-exec tool authentication', () => {
 
       const failed = await manager.executeCommand('false', undefined, 5000);
       expect(failed.code).toBe(1);
+
+      // same shell as exec mode, not root's interactive login shell
+      const shell = await manager.executeCommand('echo "${BASH_VERSION:+bash}"', undefined, 5000);
+      expect(shell.stdout).toBe('bash\n');
+
+      // the raw pty has no canonical-mode line length limit (~4 KB)
+      const long = await manager.executeCommand(`echo ${'x'.repeat(5000)} | wc -c`, undefined, 5000);
+      expect(long.stdout.trim()).toBe('5001');
+    } finally {
+      manager.close();
+    }
+  }, 30000);
+
+  it('re-elevates after the root shell exits instead of falling back to the login user', async () => {
+    const manager = new SSHConnectionManager({
+      host: '127.0.0.1', port: 2222, username: 'test', password: 'secret', suPassword: 'secret',
+    });
+    try {
+      await manager.connect();
+      await manager.ensureElevated();
+      await expect(manager.executeCommand('exit 0', undefined, 5000)).rejects.toThrow(/su shell closed/);
+
+      await manager.ensureElevated();
+      const whoami = await manager.executeCommand('whoami', undefined, 5000);
+      expect(whoami.stdout).toBe('root\n');
+    } finally {
+      manager.close();
+    }
+  }, 30000);
+
+  it('rejects a wrong su password without leaking it', async () => {
+    const manager = new SSHConnectionManager({
+      host: '127.0.0.1', port: 2222, username: 'test', password: 'secret', suPassword: 'wrong-pass-123',
+    });
+    try {
+      await manager.connect();
+      const err = await manager.ensureElevated().then(() => null, (e: Error) => e);
+      expect(err?.message).toMatch(/su failed|closed/i);
+      expect(err?.message).not.toContain('wrong-pass-123');
+
+      const whoami = await manager.executeCommand('whoami', undefined, 5000);
+      expect(whoami.stdout).toBe('test\n');
     } finally {
       manager.close();
     }
