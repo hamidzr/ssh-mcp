@@ -200,6 +200,29 @@ describe('sudo-exec tool authentication', () => {
     expect(text).toMatch(/sorry|incorrect|authentication/);
   });
 
+  it('keeps the sudo password out of the remote process list', async () => {
+    const pending = runMcpCommand('sleep 2.37', ['--sudoPassword=secret']);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    const observer = new SSHConnectionManager({ host: '127.0.0.1', port: 2222, username: 'test', password: 'secret' });
+    try {
+      const ps = await observer.executeCommand('ps -eo args', undefined, 5000);
+      const sudoLines = ps.stdout.split('\n').filter((line) => line.includes('2.37'));
+      expect(sudoLines.length).toBeGreaterThan(0);
+      expect(sudoLines.join('\n')).not.toContain('secret');
+    } finally {
+      observer.close();
+    }
+
+    const res = await pending;
+    expect(res.result?.isError).toBeFalsy();
+  }, 30000);
+
+  it('does not hand the sudo password to the command on stdin', async () => {
+    const res = await runMcpCommand('cat; echo done', ['--sudoPassword=secret']);
+    expect(res.result?.content?.[0]?.text).toBe('done\n');
+  });
+
   it('executes with correct sudo password', async () => {
     const res = await runMcpCommand('id', ['--sudoPassword=secret']);
     expect(res.error).toBeUndefined();

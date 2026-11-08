@@ -1213,15 +1213,15 @@ function registerSingleHostTools(
             ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
             : sanitizedCommand;
 
-          let wrapped: string;
-          if (!sudoPwd) {
-            wrapped = `sudo -n ${sudoShell} -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
-          } else {
-            const pwdEscaped = sudoPwd.replace(/'/g, "'\\''");
-            wrapped = `printf '%s\\n' '${pwdEscaped}' | sudo -p "" -S ${sudoShell} -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
-          }
+          // the password travels on stdin, never in argv where any local user could read it from ps.
+          // the command gets /dev/null as stdin so it cannot read a password sudo left unread
+          // (cached credentials, NOPASSWD)
+          const script = shellQuote(`exec </dev/null\n${commandWithDescription}`);
+          const wrapped = sudoPwd
+            ? `sudo -p '' -S ${sudoShell} -c ${script}`
+            : `sudo -n ${sudoShell} -c ${script}`;
 
-          return await execSshCommandWithConnection(manager, wrapped, undefined, toolTimeout);
+          return await execSshCommandWithConnection(manager, wrapped, sudoPwd ? `${sudoPwd}\n` : undefined, toolTimeout);
         } catch (err: any) {
           if (err instanceof McpError) throw err;
           throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
