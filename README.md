@@ -55,7 +55,7 @@
 
 All `exec` / `exec__*` tools accept:
 - `command` (required): Shell command to execute
-- `description` (optional): Appended as a comment for audit trails
+- `description` (optional): Added as a single comment line before the command, for audit trails (newlines are flattened)
 
 **Configuration:**
 - Timeout: `--timeout` (ms, default 60000)

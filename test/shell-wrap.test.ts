@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'child_process';
 import { existsSync } from 'fs';
-import { SuSession, buildMarkedShellPayload, extractShellMarker, parseShellProbe, shellQuote, wrapWithShell } from '../src/index.js';
+import { SuSession, buildMarkedShellPayload, extractShellMarker, parseShellProbe, shellQuote, withDescription, wrapWithShell } from '../src/index.js';
 
 describe('parseShellProbe', () => {
   it('returns the probed path', () => {
@@ -118,5 +118,16 @@ describe('SuSession', () => {
     su.push(`${marker}_SU\r\nPassword: `);
     expect(su.push('\r\nsu: warning: cannot change directory to /root\r\n')).toEqual({});
     expect(su.push('root@host:/# ').send).toContain('stty raw -echo');
+  });
+});
+
+describe('withDescription', () => {
+  it('puts a flattened description on its own comment line before the command', () => {
+    expect(withDescription('ls', 'list\r\nrm -rf /')).toBe('# list rm -rf /\nls');
+  });
+
+  it('leaves the command alone without a description', () => {
+    expect(withDescription('ls', '  ')).toBe('ls');
+    expect(withDescription('ls')).toBe('ls');
   });
 });

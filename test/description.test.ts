@@ -93,6 +93,23 @@ describe('command description functionality', () => {
     // Should execute successfully with sudo
   });
 
+  // regression: a newline in the description escaped the trailing # comment and ran as a command
+  it('never runs description text as a command', async () => {
+    const res = await runMcpCommand('echo safe', 'harmless\necho INJECTED');
+    expect(res.result?.content?.[0]?.text).toBe('safe\n');
+  });
+
+  it('never runs sudo-exec description text as a command', async () => {
+    const res = await runMcpCommand('echo safe', "x\necho INJECTED'", ['--sudoPassword=secret'], 'sudo-exec');
+    expect(res.result?.content?.[0]?.text).toBe('safe\n');
+  });
+
+  // regression: the trailing comment turned the here-doc terminator into `EOF # ...`
+  it('keeps here-doc commands working with a description', async () => {
+    const res = await runMcpCommand("cat <<'EOF'\nhello\nEOF", 'print a here-doc');
+    expect(res.result?.content?.[0]?.text).toBe('hello\n');
+  });
+
   it('should handle empty description parameter', async () => {
     const res = await runMcpCommand('pwd', '');
     expect(res.error).toBeUndefined();

@@ -435,6 +435,13 @@ export class SuSession {
   }
 }
 
+// the description becomes one comment line before the command. a trailing comment would break
+// here-doc terminators and line continuations, and a newline in it would start a new command
+export function withDescription(command: string, description?: string): string {
+  const text = description?.replace(/[\r\n]+/g, ' ').trim();
+  return text ? `# ${text}\n${command}` : command;
+}
+
 // Escape command for use in shell contexts (like pkill)
 export function escapeCommandForShell(command: string): string {
   // Replace single quotes with escaped single quotes
@@ -1195,8 +1202,9 @@ function registerSingleHostTools(
           }
         }
 
-        const commandWithDescription = description
-          ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
+        // no POSIX shell (eg Windows): a `#` line is not a comment there, run the command as is
+        const commandWithDescription = (await manager.getCommandShell())
+          ? withDescription(sanitizedCommand, description)
           : sanitizedCommand;
 
         return await execSshCommandWithConnection(manager, commandWithDescription, undefined, toolTimeout);
@@ -1232,9 +1240,7 @@ function registerSingleHostTools(
 
           const sudoPwd = manager.getSudoPassword();
           const sudoShell = (await manager.getCommandShell()) ?? 'sh';
-          const commandWithDescription = description
-            ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
-            : sanitizedCommand;
+          const commandWithDescription = withDescription(sanitizedCommand, description);
 
           // the password travels on stdin, never in argv where any local user could read it from ps.
           // the command gets /dev/null as stdin so it cannot read a password sudo left unread
