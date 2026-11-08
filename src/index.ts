@@ -50,6 +50,8 @@ const KEY = argvConfig.key;
 const DEFAULT_TIMEOUT = argvConfig.timeout ? parseInt(argvConfig.timeout) : 60000; // 60 seconds default timeout
 const SHELL_PROBE_TIMEOUT = 10000;
 const SU_ELEVATION_TIMEOUT = 10000;
+// how long a persistent-shell command waits for its stderr marker after stdout finished
+const STDERR_GRACE_MS = 1000;
 // Max characters configuration:
 // - Default: 1000 characters
 // - When set via --maxChars:
@@ -337,15 +339,19 @@ export function wrapWithShell(command: string, shellPath: string | null): string
 // - the command gets its own stdin, otherwise reading stdin would swallow the following lines.
 //   given stdin is piped from the printf builtin (not a here-doc, which older bash writes to a temp
 //   file); that pipeline runs in a subshell, so such a command does not persist state
-export function buildMarkedShellPayload(command: string, marker: string, stdin?: string): string {
+// - with separateStderr, stderr gets the same start/end markers, since it travels on its own
+//   stream and can arrive after the stdout marker
+export function buildMarkedShellPayload(command: string, marker: string, stdin?: string, separateStderr = false): string {
   const run = `command eval ${shellQuote(command)}`;
   const line = stdin === undefined || stdin.length === 0
     ? `${run} </dev/null`
     : `printf '%s' ${shellQuote(stdin)} | ${run}`;
   return [
     `printf '%s_START\\n' '${marker}'`,
+    ...(separateStderr ? [`printf '%s_START\\n' '${marker}' >&2`] : []),
     line,
     `printf '%s:%s\\n' '${marker}' "$?"`,
+    ...(separateStderr ? [`printf '%s:%s\\n' '${marker}' 0 >&2`] : []),
     '',
   ].join('\n');
 }
@@ -610,12 +616,16 @@ export class SSHConnectionManager {
       return new Promise((resolve, reject) => {
         const marker = this.makeShellMarker();
         let stdoutBuffer = this.persistentStdoutCarry;
+        let stderrBuffer = '';
         this.persistentStdoutCarry = '';
-        let stderr = '';
+        let stdoutResult: { output: string; code: number } | null = null;
+        let stderrOutput: string | null = null;
+        let stderrGraceId: NodeJS.Timeout | undefined;
         let settled = false;
 
         const cleanup = () => {
           clearTimeout(timeoutId);
+          clearTimeout(stderrGraceId);
           shell.removeListener('data', onStdout);
           shell.removeListener('close', onClose);
           shell.removeListener('error', onError);
@@ -629,28 +639,35 @@ export class SSHConnectionManager {
           reject(error);
         };
 
-        const finishWithResult = (result: CommandExecutionResult) => {
-          if (settled) return;
+        const finishIfComplete = (force = false) => {
+          if (settled || !stdoutResult) return;
+          if (stderrOutput === null && !force) return;
           settled = true;
           cleanup();
-          resolve(result);
+          // best effort when the stderr marker never came (eg `exec 2>/dev/null`)
+          const stderr = stderrOutput ?? stderrBuffer.replace(new RegExp(`^[\\s\\S]*?${marker}_START\\n`), '');
+          resolve({ stdout: stdoutResult.output, stderr, code: stdoutResult.code });
         };
 
         const onStdout = (chunk: Buffer) => {
+          if (stdoutResult) return;
           stdoutBuffer += chunk.toString();
           const parsed = extractShellMarker(stdoutBuffer, marker);
           if (!parsed.done) return;
 
           this.persistentStdoutCarry = parsed.remainder;
-          finishWithResult({
-            stdout: parsed.output,
-            stderr,
-            code: parsed.code,
-          });
+          stdoutResult = { output: parsed.output, code: parsed.code };
+          stderrGraceId = setTimeout(() => finishIfComplete(true), STDERR_GRACE_MS);
+          finishIfComplete();
         };
 
         const onStderr = (chunk: Buffer) => {
-          stderr += chunk.toString();
+          if (stderrOutput !== null) return;
+          stderrBuffer += chunk.toString();
+          const parsed = extractShellMarker(stderrBuffer, marker);
+          if (!parsed.done) return;
+          stderrOutput = parsed.output;
+          finishIfComplete();
         };
 
         const onClose = () => {
@@ -671,7 +688,7 @@ export class SSHConnectionManager {
         shell.on('error', onError);
         try { (shell as any).stderr?.on('data', onStderr); } catch (_e) { /* ignore */ }
 
-        const payload = buildMarkedShellPayload(command, marker, stdin);
+        const payload = buildMarkedShellPayload(command, marker, stdin, true);
         try {
           shell.write(payload);
         } catch (err: any) {

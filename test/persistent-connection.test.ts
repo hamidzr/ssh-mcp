@@ -367,6 +367,27 @@ describe('SSHConnectionManager', () => {
       }
     }, 30000);
 
+    // regression: stderr arrives on its own stream and usually lost the race with the stdout marker
+    it('should attribute persistent-shell stderr to the command that wrote it', async () => {
+      const persistentManager = new SSHConnectionManager({
+        host, port, username, password, executionMode: 'persistent-shell',
+      });
+      try {
+        await persistentManager.connect();
+        for (let i = 0; i < 10; i++) {
+          const result = await persistentManager.executeCommand(`echo out${i}; echo err${i} >&2; false`, undefined, 5000);
+          expect(result).toEqual({ stdout: `out${i}\n`, stderr: `err${i}\n`, code: 1 });
+        }
+
+        // a shell whose stderr was redirected away still completes commands
+        await persistentManager.executeCommand('exec 2>/dev/null', undefined, 5000);
+        const quiet = await persistentManager.executeCommand('echo still-here', undefined, 5000);
+        expect(quiet.stdout).toBe('still-here\n');
+      } finally {
+        persistentManager.close();
+      }
+    }, 30000);
+
     // regression: a dropped connection or a signal-killed command used to report success
     it('should fail commands killed by a signal or cut off by a lost connection', async () => {
       await manager.connect();
